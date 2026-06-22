@@ -1,0 +1,84 @@
+name: austria-job-scout
+description: Find similar Austrian job postings given a reference job. Modular, residential-IP-safe, ATS-aware. Sidecar-imports job-research-framework and firmen-quickcheck (no fork).
+type: skill
+version: 0.1.0
+
+# Skill lives in ~/.hermes/skills/productivity/austria-job-scout/
+# Project code lives in ~/.hermes/projects/austria-job-scout/
+
+env:
+  - name: AUSTRIA_JOB_SCOUT_DB
+    description: Path to the SQLite index DB.
+    default: ~/.hermes/projects/austria-job-scout/data/austria_jobs.db
+  - name: AUSTRIA_JOB_SCOUT_AGGRESSIVE
+    description: "1 = user is behind a proxy/VPN, not on residential IP. Enables high-volume + WAF-site fetching. Default 0 (conservative)."
+    default: "0"
+  - name: AUSTRIA_JOB_SCOUT_DELAY_MIN
+    description: Minimum delay between requests (seconds). Long-tail distribution; 5-25s is residential-safe.
+    default: "5"
+  - name: AUSTRIA_JOB_SCOUT_DELAY_MAX
+    description: Maximum delay between requests (seconds).
+    default: "25"
+  - name: AUSTRIA_JOB_SCOUT_DAILY_BUDGET
+    description: Hard cap on requests per UTC day (residential mode).
+    default: "50"
+  - name: AUSTRIA_JOB_SCOUT_DAILY_BUDGET_CF
+    description: Hard cap on requests to WAF-protected sites per UTC day (residential mode).
+    default: "10"
+  - name: AUSTRIA_JOB_SCOUT_MAX_PER_RUN
+    description: Hard cap on fetches per single `pipeline` invocation. Remainder → wishlist.
+    default: "25"
+  - name: AUSTRIA_JOB_SCOUT_MIN_OVERLAP
+    description: Minimum skill-Jaccard overlap to fully index a parsed posting (0.0-1.0).
+    default: "0.20"
+  - name: OPENDATA_API_KEY
+    description: opendata.host HTTP-Basic API key (optional; company-status enrichment skipped if missing).
+    default: ""
+  - name: AUSTRIA_JOB_SCOUT_EMBED_MODEL
+    description: Sentence-transformers model id (local embedding).
+    default: "sentence-transformers/all-MiniLM-L6-v2"
+
+dependencies:
+  python_packages:
+    - requests>=2.28.0
+    - beautifulsoup4>=4.11.0
+    - lxml>=4.9.0
+    - pymupdf>=1.23.0
+    - pymupdf4llm>=0.0.12
+    - python-docx>=0.8.11
+    - curl_cffi>=0.15.0
+    - numpy>=1.24.0
+    - scikit-learn>=1.2.0
+    - sentence-transformers>=2.2.0
+    - pytest>=7.4
+  system_packages:
+    - sqlite3
+  sidecar_projects:
+    - name: job-research-framework
+      path: ~/.hermes/projects/job-research-framework
+      used_for: stealth_fetch, ct_log_miner, HybridSearch, EmbeddingGenerator
+      optional: true   # v1 degrades to vanilla requests + no embeddings if absent
+    - name: firmen-quickcheck
+      path: ~/company-quickcheck
+      used_for: OpenDataHostClient (company-status enrichment)
+      optional: true
+
+related_skills:
+  - anti-bot-three-pillars
+  - stealth-core-platform
+  - ocr-and-documents
+  - web-data-collection
+  - firmen-quickcheck
+  - job-research-framework
+
+verification:
+  - command: python -m austria_job_scout --help
+    description: CLI loads
+  - command: python -m austria_job_scout db-init
+    description: DB schema applied idempotently
+  - command: python -m austria_job_scout db-stats
+    description: DB introspection
+  - command: python -m austria_job_scout ingest --role "Senior Rust Engineer"
+    description: Ingest module works without any network I/O
+  - command: cd ~/.hermes/projects/austria-job-scout && python -m pytest tests/ -q
+    description: All tests pass (smoke + ingest + db)

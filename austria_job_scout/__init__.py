@@ -1,0 +1,1 @@
+"""austria-job-scout: Modular Austrian job scout with stealth support and deduplication."""

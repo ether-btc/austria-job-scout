@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "austria-job-scout"
+version = "0.1.0"
+description = "Find similar Austrian job postings given a reference job — modular, residential-IP-safe."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "user"}]
+keywords = ["austria", "jobs", "scraping", "stealth", "careers"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Office/Business",
+]
+dependencies = [
+    "requests>=2.28.0",
+    "beautifulsoup4>=4.11.0",
+    "lxml>=4.9.0",
+    "pymupdf>=1.23.0",          # text PDFs
+    "pymupdf4llm>=0.0.12",
+    "python-docx>=0.8.11",
+]
+
+[project.optional-dependencies]
+embeddings = [
+    "sentence-transformers>=2.2.0",
+    "numpy>=1.24.0",
+    "scikit-learn>=1.2.0",
+]
+stealth = [
+    "curl_cffi>=0.15.0",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+]
+
+[project.scripts]
+austria-job-scout = "austria_job_scout.cli:main"
+
+[tool.setuptools]
+packages = ["austria_job_scout", "austria_job_scout.modules", "austria_job_scout.probes", "austria_job_scout.extractors"]
+
+[tool.setuptools.package-data]
+austria_job_scout = ["schema.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --tb=short"

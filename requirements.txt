@@ -1,0 +1,23 @@
+# Core (always required)
+requests>=2.28.0
+beautifulsoup4>=4.11.0
+lxml>=4.9.0
+
+# Input parsing (PDFs / DOCX)
+pymupdf>=1.23.0
+pymupdf4llm>=0.0.12
+python-docx>=0.8.11
+
+# Sidecar import from job-research-framework (optional but recommended)
+# When present, the fetcher uses jrf.scripts.stealth_fetch (curl_cffi TLS impersonation).
+# Without it, vanilla requests is used (less stealth, only safe on soft-anti-bot sites).
+curl_cffi>=0.15.0
+
+# Embeddings + similarity (optional; v1 degrades to keyword-only if missing)
+sentence-transformers>=2.2.0
+numpy>=1.24.0
+scikit-learn>=1.2.0
+
+# Tests
+pytest>=7.4
+pytest-cov>=4.1
