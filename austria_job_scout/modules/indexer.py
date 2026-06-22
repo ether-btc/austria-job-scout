@@ -137,8 +137,14 @@ class JobIndexer:
                 # Fallback to multilingual MiniLM if e5-small-v2 fails
                 try:
                     self.embedding_model = SentenceTransformer("intfloat/e5-small-v2")
-                except Exception:
-                    self.embedding_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+                except Exception as e:
+                    print(f"Failed to load e5-small-v2: {e}. Trying multilingual MiniLM...")
+                    try:
+                        self.embedding_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+                    except Exception as e2:
+                        print(f"Failed to load multilingual MiniLM: {e2}. Falling back to TF-IDF")
+                        self.use_ml = False
+                        self.tfidf = SimpleEmbedding()
             except ImportError:
                 print("sentence-transformers not available, falling back to TF-IDF")
                 self.use_ml = False

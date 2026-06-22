@@ -334,7 +334,7 @@ def _is_remote(job_data: dict[str, Any]) -> bool:
 def _extract_skills_from_text(text: str) -> list[str]:
     """Extract potential skills from job description."""
     # Simple heuristic: look for capitalized technical terms
-    # TODO: Could be improved with a skill library
+    # Skill library integration is a future enhancement
     skills = []
 
     # Common technical terms
