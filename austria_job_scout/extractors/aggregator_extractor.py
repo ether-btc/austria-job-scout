@@ -9,8 +9,6 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-from austria_job_scout.modules.config import settings
-
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
