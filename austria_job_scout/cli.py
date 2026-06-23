@@ -47,6 +47,32 @@ from .modules import ingest as ingest_mod, target_discovery, fetcher as fetcher_
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load_json_arg(arg: str):
+    """Load JSON from a file path, '-' (stdin), or inline JSON string."""
+    import json as _json
+    if arg == "-":
+        return _json.loads(sys.stdin.read())
+    if arg.strip().startswith("[") or arg.strip().startswith("{"):
+        return _json.loads(arg)
+    return _json.loads(Path(arg).read_text(encoding="utf-8"))
+
+
+def _job_to_dict(job) -> dict:
+    """Convert an ATSJob or AggregatorJob to a JSON-serializable dict."""
+    result = {}
+    for field in ("url", "title", "company", "location", "description",
+                  "skills", "seniority", "employment_type", "remote",
+                  "salary_min", "salary_max", "currency", "posted_date"):
+        val = getattr(job, field, None)
+        if val is not None:
+            result[field] = val
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Subcommand handlers
 # ---------------------------------------------------------------------------
 
@@ -204,12 +230,202 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_stub(name: str) -> int:
-    def _fn(_args: argparse.Namespace) -> int:
-        print(f"error: `{name}` is iter-3/4 work. See .planning/01-1-PLAN.md", file=sys.stderr)
-        return 3
-    _fn.__name__ = f"cmd_{name}"
-    return _fn
+def _cmd_extract(args: argparse.Namespace) -> int:
+    """Extract structured job data from pre-fetched responses."""
+    from .modules.extractor import extract
+    from .modules.fetcher import RawResponse
+
+    raw_data = _load_json_arg(args.raw)
+    if not isinstance(raw_data, list):
+        print("error: --raw must be a JSON array of response objects", file=sys.stderr)
+        return 1
+
+    results = []
+    for item in raw_data:
+        resp = RawResponse(
+            url=item.get("url", ""),
+            status_code=item.get("status_code"),
+            text=item.get("text"),
+            ats_fingerprint=item.get("ats_fingerprint", "unknown"),
+        )
+        jobs = extract(resp)
+        for j in jobs:
+            results.append(_job_to_dict(j))
+
+    print(json.dumps(results, indent=2, ensure_ascii=False, default=str))
+    return 0
+
+
+def _cmd_index(args: argparse.Namespace) -> int:
+    """Index extracted jobs into embeddings."""
+    from .modules.indexer import JobIndexer
+
+    jobs_data = _load_json_arg(args.jobs)
+    if not isinstance(jobs_data, list):
+        print("error: --jobs must be a JSON array", file=sys.stderr)
+        return 1
+
+    indexer = JobIndexer(use_ml=args.ml)
+    indexed = []
+    for j in jobs_data:
+        ij = indexer.index_job(
+            url=j.get("url", ""),
+            title=j.get("title"),
+            company=j.get("company"),
+            location=j.get("location"),
+            description=j.get("description"),
+            skills=j.get("skills", []),
+            seniority=j.get("seniority"),
+            employment_type=j.get("employment_type"),
+            remote=j.get("remote"),
+            salary_min=j.get("salary_min"),
+            salary_max=j.get("salary_max"),
+        )
+        indexed.append({
+            "url": ij.url,
+            "job_id": ij.job_id,
+            "title": ij.title,
+            "embedding_dim": len(ij.embedding) if ij.embedding is not None else 0,
+        })
+
+    print(json.dumps({"indexed": len(indexed), "jobs": indexed}, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _cmd_score(args: argparse.Namespace) -> int:
+    """Score candidate jobs against a reference job."""
+    from .modules.indexer import JobIndexer
+    from .modules.similarity import analyze_similarity
+
+    ref_data = _load_json_arg(args.reference)
+    jobs_data = _load_json_arg(args.jobs) if args.jobs else []
+
+    indexer = JobIndexer(use_ml=args.ml)
+    ref_indexed = indexer.index_job(
+        url=ref_data.get("url", "reference"),
+        title=ref_data.get("title"),
+        company=ref_data.get("company"),
+        description=ref_data.get("description"),
+        skills=ref_data.get("skills", []),
+    )
+    candidates = []
+    for j in jobs_data:
+        ij = indexer.index_job(
+            url=j.get("url", ""),
+            title=j.get("title"),
+            company=j.get("company"),
+            description=j.get("description"),
+            skills=j.get("skills", []),
+        )
+        candidates.append(ij)
+
+    matches = analyze_similarity(
+        reference_job=ref_indexed,
+        candidate_jobs=candidates,
+        top_k=args.top_k,
+        min_score=args.min_score,
+    )
+    result = [
+        {
+            "title": m.job.title,
+            "company": m.job.company,
+            "url": m.job.url,
+            "score": round(m.overall_score, 3),
+            "breakdown": {
+                "title": round(m.title_similarity, 3),
+                "description": round(m.description_similarity, 3),
+                "skills": round(m.skills_overlap, 3),
+            },
+        }
+        for m in matches
+    ]
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    """Generate a report from scored matches."""
+    from .modules.reporter import generate_text_report, generate_json_report, generate_csv_report
+
+    scored_data = _load_json_arg(args.scored)
+    if not isinstance(scored_data, list):
+        print("error: --scored must be a JSON array", file=sys.stderr)
+        return 1
+
+    from .modules.similarity import JobMatch
+    from .modules.indexer import IndexedJob
+
+    matches = []
+    for s in scored_data:
+        ij = IndexedJob(
+            job_id="0",
+            url=s.get("url", ""),
+            title=s.get("title", ""),
+            company=s.get("company", ""),
+            location=s.get("location"),
+            description=s.get("description"),
+        )
+        breakdown = s.get("breakdown", {})
+        jm = JobMatch(
+            job=ij,
+            overall_score=s.get("score", 0.0),
+            title_similarity=breakdown.get("title", 0.0),
+            description_similarity=breakdown.get("description", 0.0),
+            skills_overlap=breakdown.get("skills", 0.0),
+            location_match=s.get("location_match", False),
+            seniority_match=s.get("seniority_match", False),
+            salary_compatibility=s.get("salary_compatibility", 0.0),
+        )
+        matches.append(jm)
+
+    title = args.title or "Job Matches"
+    fmt = args.format or "text"
+
+    if fmt == "json":
+        report = generate_json_report(title, "N/A", matches)
+    elif fmt == "csv":
+        report = generate_csv_report(title, matches)
+    else:
+        report = generate_text_report(title, matches)
+
+    if args.out:
+        Path(args.out).write_text(report, encoding="utf-8")
+        print(f"Report saved to {args.out}", file=sys.stderr)
+    else:
+        print(report)
+    return 0
+
+
+def _cmd_pipeline(args: argparse.Namespace) -> int:
+    """Run the full pipeline end-to-end."""
+    from .modules.pipeline import JobScoutPipeline
+
+    ref = str(args.input) if args.input else args.role
+    if not ref:
+        print("error: pass exactly one of --input or --role", file=sys.stderr)
+        return 1
+
+    pipeline = JobScoutPipeline(use_ml=args.ml)
+    try:
+        results = pipeline.run(
+            reference_job=ref,
+            output_dir=args.out,
+            max_fetches=args.max_fetches,
+            min_similarity=args.min_score,
+            top_k=args.top_k,
+            report_format=args.format or "all",
+        )
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(json.dumps({
+        "status": results.get("status"),
+        "matches": len(results.get("matches", [])),
+        "stats": results.get("stats"),
+        "reports": results.get("reports"),
+    }, indent=2))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -265,12 +481,45 @@ def build_parser() -> argparse.ArgumentParser:
                     help="skip the GET /, GET /jobs referer-chain warm-up (only for tests)")
     sp.set_defaults(func=cmd_fetch)
 
-    for name in ("extract", "index", "score", "report"):
-        sp = sub.add_parser(name, parents=[sub_parent], help=f"[iter-3/4] {name} subcommand")
-        sp.set_defaults(func=_cmd_stub(name))
+    # --- extract ---
+    sp = sub.add_parser("extract", parents=[sub_parent], help="extract structured job data from pre-fetched responses")
+    sp.add_argument("--raw", required=True, help="JSON array of response objects (file path, '-', or inline)")
+    sp.set_defaults(func=_cmd_extract)
 
-    sp = sub.add_parser("pipeline", parents=[sub_parent], help="[iter-4] run all subcommands end-to-end")
-    sp.set_defaults(func=_cmd_stub("pipeline"))
+    # --- index ---
+    sp = sub.add_parser("index", parents=[sub_parent], help="index extracted jobs into embeddings")
+    sp.add_argument("--jobs", required=True, help="JSON array of extracted job objects")
+    sp.add_argument("--ml", action="store_true", help="use sentence-transformers (requires optional dependency)")
+    sp.set_defaults(func=_cmd_index)
+
+    # --- score ---
+    sp = sub.add_parser("score", parents=[sub_parent], help="score candidate jobs against a reference")
+    sp.add_argument("--reference", required=True, help="reference job JSON (file path, '-', or inline)")
+    sp.add_argument("--jobs", help="candidate jobs JSON array (default: read from indexed DB)")
+    sp.add_argument("--ml", action="store_true", help="use sentence-transformers")
+    sp.add_argument("--min-score", type=float, default=0.3, help="minimum similarity score (default: 0.3)")
+    sp.add_argument("--top-k", type=int, default=10, help="max matches to return")
+    sp.set_defaults(func=_cmd_score)
+
+    # --- report ---
+    sp = sub.add_parser("report", parents=[sub_parent], help="generate a report from scored matches")
+    sp.add_argument("--scored", required=True, help="JSON array of scored matches")
+    sp.add_argument("--format", choices=["text", "json", "csv"], default="text", help="report format")
+    sp.add_argument("--title", help="report title (default: 'Job Matches')")
+    sp.add_argument("--out", help="write report to file instead of stdout")
+    sp.set_defaults(func=_cmd_report)
+
+    # --- pipeline ---
+    sp = sub.add_parser("pipeline", parents=[sub_parent], help="run the full pipeline end-to-end")
+    sp.add_argument("--input", help="path to reference job file (.pdf/.docx/.txt/.md)")
+    sp.add_argument("--role", help="free-text role name (alternative to --input)")
+    sp.add_argument("--out", help="output directory for reports")
+    sp.add_argument("--max-fetches", type=int, default=None, help="override MAX_FETCH_PER_RUN")
+    sp.add_argument("--min-score", type=float, default=0.3, help="minimum similarity score")
+    sp.add_argument("--top-k", type=int, default=10, help="number of top matches")
+    sp.add_argument("--format", choices=["text", "json", "csv", "all"], default="all", help="report format")
+    sp.add_argument("--ml", action="store_true", help="use sentence-transformers")
+    sp.set_defaults(func=_cmd_pipeline)
 
     return p
 

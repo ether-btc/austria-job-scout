@@ -251,8 +251,15 @@ def extract_from_url(url: str) -> list[AggregatorJob] | None:
     except requests.RequestException:
         return None
 
-    html = response.text
+    return extract_from_html(url, response.text)
 
+
+def extract_from_html(url: str, html: str) -> list[AggregatorJob] | None:
+    """Extract aggregator job listings from pre-fetched HTML (avoids double-fetch).
+
+    Pillar 0-compliant: pipeline already fetched the page, so we parse
+    the HTML directly instead of making a second HTTP request.
+    """
     # Detect source from URL patterns
     if "karriere.at" in url:
         return extract_karriere_at_listing(html, url)

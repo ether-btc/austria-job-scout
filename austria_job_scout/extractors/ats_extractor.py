@@ -289,8 +289,16 @@ def extract_from_url(url: str) -> ATSJob | None:
     except requests.RequestException:
         return None
 
-    html = response.text
+    return extract_from_html(url, response.text)
 
+
+def extract_from_html(url: str, html: str) -> ATSJob | None:
+    """Extract ATS job data from pre-fetched HTML (avoids double-fetch).
+
+    This is the Pillar 0-compliant entry point: the pipeline already
+    fetched the page in Step 3, so we parse the HTML directly instead
+    of making a second HTTP request.
+    """
     # Detect ATS from URL patterns
     if "workday" in url.lower():
         jobs = extract_workday(html)

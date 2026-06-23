@@ -113,13 +113,31 @@ def test_ingest_rejects_both_args(capsys):
     assert rc == 2
 
 
-def test_stub_subcommands_exit_with_3(capsys):
-    """Iter-3/4 subcommands must fail loudly (exit 3) when invoked."""
-    for name in ("extract", "index", "score", "report", "pipeline"):
-        rc = _run([name])
-        assert rc == 3, f"{name} should exit 3 (NotImplementedError)"
-        err = capsys.readouterr().err
-        assert "iter-3" in err or "iter-4" in err
+def test_new_subcommands_require_args(capsys):
+    """Iter-3/4 subcommands are now implemented and require their args."""
+    # extract requires --raw (argparse raises SystemExit(2))
+    with pytest.raises(SystemExit) as exc_info:
+        _run(["extract"])
+    assert exc_info.value.code == 2
+
+    # index requires --jobs
+    with pytest.raises(SystemExit) as exc_info:
+        _run(["index"])
+    assert exc_info.value.code == 2
+
+    # score requires --reference
+    with pytest.raises(SystemExit) as exc_info:
+        _run(["score"])
+    assert exc_info.value.code == 2
+
+    # report requires --scored
+    with pytest.raises(SystemExit) as exc_info:
+        _run(["report"])
+    assert exc_info.value.code == 2
+
+    # pipeline requires --input or --role (custom validation, not argparse)
+    rc = _run(["pipeline"])
+    assert rc == 1
 
 
 def test_ingest_missing_file_returns_1(tmp_path, capsys):

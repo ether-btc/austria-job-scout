@@ -7,21 +7,19 @@ from typing import Any
 
 from austria_job_scout.extractors.ats_extractor import (
     ATSJob,
-    extract_from_url as extract_ats_url,
+    extract_from_html as extract_ats_html,
 )
 from austria_job_scout.extractors.aggregator_extractor import (
     AggregatorJob,
-    extract_from_url as extract_aggregator_url,
+    extract_from_html as extract_aggregator_html,
 )
-from austria_job_scout.modules.config import settings
-from austria_job_scout.modules.db import init_db
+from .. import config
 from austria_job_scout.modules.fetcher import (
-    Target,
-    fetch_targets,
-    respect_daily_budget,
+    RawResponse,
+    fetch as fetch_targets,
 )
 from austria_job_scout.modules.indexer import JobIndexer, IndexedJob
-from austria_job_scout.modules.ingest import ingest
+from austria_job_scout.modules.ingest import ingest_input as ingest
 from austria_job_scout.modules.reporter import (
     ReportConfig,
     generate_csv_report,
@@ -29,7 +27,7 @@ from austria_job_scout.modules.reporter import (
     generate_text_report,
 )
 from austria_job_scout.modules.similarity import JobMatch, analyze_similarity
-from austria_job_scout.modules.target_discovery import discover_targets
+from austria_job_scout.modules.target_discovery import discover as discover_targets
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -50,7 +48,7 @@ class JobScoutPipeline:
             db_path: Path to SQLite database. If None, uses default from settings.
             use_ml: If True, use sentence-transformers for embeddings.
         """
-        self.db_path = db_path or settings.DB_PATH
+        self.db_path = db_path or config.DEFAULT_DB_PATH
         self.use_ml = use_ml
 
         # Initialize components
@@ -101,11 +99,15 @@ class JobScoutPipeline:
         max_allowed = max_fetches or self._get_max_fetches()
         targets_to_fetch = targets[:max_allowed]
 
-        logger.info(f"Found {len(targets)} targets, fetching {len(targets_to_fetch)}")
+        logger.info("Found %d targets, fetching %d", len(targets), len(targets_to_fetch))
 
         # Step 3: Fetch targets (with stealth)
         logger.info("Step 3: Fetching targets (with stealth protection)...")
-        fetched = fetch_targets(targets_to_fetch)
+        try:
+            fetched = fetch_targets(targets_to_fetch)
+        except Exception as e:
+            logger.warning("Fetch stopped early: %s", e)
+            fetched = getattr(fetch_targets, 'last_blocked', [])
 
         if not fetched:
             logger.warning("No targets were fetched successfully")
@@ -122,20 +124,20 @@ class JobScoutPipeline:
 
         logger.info(f"Fetched {len(fetched)} targets")
 
-        # Step 4: Extract job details
+        # Step 4: Extract job details (from pre-fetched HTML — no double-fetch)
         logger.info("Step 4: Extracting job details...")
         extracted_jobs = []
 
-        for target in fetched:
-            # Detect ATS vs aggregator
-            if any(ats in target.ats for ats in ["workday", "greenhouse", "lever", "smartrecruiters"]):
-                # ATS extraction
-                ats_job = extract_ats_url(target.url)
+        for resp in fetched:
+            if resp.text is None or resp.status_code is None or resp.status_code >= 400:
+                continue
+            ats = resp.ats_fingerprint or "unknown"
+            if any(a in ats for a in ["workday", "greenhouse", "lever", "smartrecruiters"]):
+                ats_job = extract_ats_html(resp.url, resp.text)
                 if ats_job:
                     extracted_jobs.append(ats_job)
             else:
-                # Aggregator extraction
-                agg_jobs = extract_aggregator_url(target.url)
+                agg_jobs = extract_aggregator_html(resp.url, resp.text)
                 if agg_jobs:
                     extracted_jobs.extend(agg_jobs)
 
@@ -259,11 +261,7 @@ class JobScoutPipeline:
 
     def _get_max_fetches(self) -> int:
         """Get maximum fetches based on budget."""
-        if respect_daily_budget():
-            return settings.MAX_FETCH_PER_RUN
-        else:
-            logger.warning("Daily budget exhausted, returning 0 fetches")
-            return 0
+        return config.MAX_FETCH_PER_RUN
 
 
 # ---------------------------------------------------------------------------
