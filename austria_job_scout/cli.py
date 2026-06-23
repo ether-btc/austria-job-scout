@@ -51,13 +51,26 @@ from .modules import ingest as ingest_mod, target_discovery, fetcher as fetcher_
 # ---------------------------------------------------------------------------
 
 def _load_json_arg(arg: str):
-    """Load JSON from a file path, '-' (stdin), or inline JSON string."""
+    """Load JSON from a file path, '-' (stdin), or inline JSON string.
+
+    Raises a ValueError with a user-friendly message on parse or file errors.
+    """
     import json as _json
     if arg == "-":
         return _json.loads(sys.stdin.read())
-    if arg.strip().startswith("[") or arg.strip().startswith("{"):
-        return _json.loads(arg)
-    return _json.loads(Path(arg).read_text(encoding="utf-8"))
+    stripped = arg.strip()
+    if stripped.startswith("[") or stripped.startswith("{"):
+        try:
+            return _json.loads(arg)
+        except _json.JSONDecodeError as e:
+            raise ValueError(f"Invalid inline JSON: {e}")
+    path = Path(arg)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {arg}")
+    try:
+        return _json.loads(path.read_text(encoding="utf-8"))
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in {arg}: {e}")
 
 
 def _job_to_dict(job) -> dict:
@@ -69,6 +82,10 @@ def _job_to_dict(job) -> dict:
         val = getattr(job, field, None)
         if val is not None:
             result[field] = val
+    # AggregatorJob has a single 'salary' string field instead of min/max
+    salary = getattr(job, "salary", None)
+    if salary is not None:
+        result["salary"] = salary
     return result
 
 

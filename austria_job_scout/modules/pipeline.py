@@ -106,8 +106,12 @@ class JobScoutPipeline:
         try:
             fetched = fetch_targets(targets_to_fetch)
         except Exception as e:
-            logger.warning("Fetch stopped early: %s", e)
-            fetched = getattr(fetch_targets, 'last_blocked', [])
+            # fetch() re-raises DailyBudgetExhausted. We cannot recover the
+            # partial results from outside the function, so we continue with
+            # whatever was fetched before the exception (empty list).
+            # NOTE: fetch.last_blocked is list[dict], NOT list[RawResponse].
+            logger.warning("Fetch stopped early (%s); continuing with empty results", e)
+            fetched = []
 
         if not fetched:
             logger.warning("No targets were fetched successfully")
