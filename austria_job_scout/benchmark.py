@@ -2,9 +2,8 @@
 """Performance benchmark for austria-job-scout.
 
 Measures:
-- Embedding model latency (TF-IDF or sentence-transformers)
+- Embedding model latency (TF-IDF)
 - Delay mechanism timing (long-tail distribution)
-- End-to-end module timing
 
 Usage:
     python -m austria_job_scout.benchmark --help
@@ -26,9 +25,22 @@ from austria_job_scout.config import AGGRESSIVE_MODE
 from austria_job_scout.modules.indexer import JobIndexer
 
 
+def _stats(values: list[float]) -> dict[str, float]:
+    """Calculate statistics for a list of values."""
+    if not values:
+        return {"mean": 0, "median": 0, "stdev": 0, "min": 0, "max": 0}
+    return {
+        "mean": statistics.mean(values),
+        "median": statistics.median(values),
+        "stdev": statistics.stdev(values) if len(values) > 1 else 0,
+        "min": min(values),
+        "max": max(values),
+    }
+
+
 def time_embedding_model(iterations: int = 10) -> dict[str, Any]:
     """Benchmark the embedding model latency."""
-    indexer = JobIndexer(use_ml=False)  # Use TF-IDF by default
+    indexer = JobIndexer(use_ml=False)  # TF-IDF only
     texts = [
         "Senior Rust Backend Developer with 5+ years experience",
         "Python Engineer for machine learning infrastructure",
@@ -39,21 +51,14 @@ def time_embedding_model(iterations: int = 10) -> dict[str, Any]:
     texts = texts[:iterations]
 
     latencies_ms = []
-    results = []
-
-    model_type = "sentence-transformers" if indexer.use_ml else "TF-IDF"
-    model_name = getattr(indexer.embedding_model, 'get_config_string', lambda: model_type)() if indexer.use_ml else model_type
 
     print(f"\n=== Embedding Model Benchmark ({iterations} iterations) ===")
-    print(f"Model type: {model_type}")
-    if indexer.use_ml and indexer.embedding_model:
-        print(f"Model: {indexer.embedding_model}")
+    print("Model: TF-IDF")
     print()
 
     for i, text in enumerate(texts, 1):
         start = time.perf_counter()
-        # Index a job to trigger embedding
-        job = indexer.index_job(
+        indexer.index_job(
             url=f"https://example.com/job{i}",
             title=text,
             company="Test Company",
@@ -61,32 +66,25 @@ def time_embedding_model(iterations: int = 10) -> dict[str, Any]:
         )
         elapsed_ms = (time.perf_counter() - start) * 1000
         latencies_ms.append(elapsed_ms)
-        results.append({"iteration": i, "latency_ms": round(elapsed_ms, 2)})
         print(f"  [{i}/{iterations}] {elapsed_ms:6.1f} ms")
 
-    mean_lat = statistics.mean(latencies_ms)
-    median_lat = statistics.median(latencies_ms)
-    stdev_lat = statistics.stdev(latencies_ms) if len(latencies_ms) > 1 else 0
-    min_lat = min(latencies_ms)
-    max_lat = max(latencies_ms)
-
+    s = _stats(latencies_ms)
     summary = {
-        "model_type": model_type,
+        "model_type": "TF-IDF",
         "iterations": iterations,
-        "mean_ms": round(mean_lat, 2),
-        "median_ms": round(median_lat, 2),
-        "stdev_ms": round(stdev_lat, 2),
-        "min_ms": round(min_lat, 2),
-        "max_ms": round(max_lat, 2),
-        "samples": results,
+        "mean_ms": round(s["mean"], 2),
+        "median_ms": round(s["median"], 2),
+        "stdev_ms": round(s["stdev"], 2),
+        "min_ms": round(s["min"], 2),
+        "max_ms": round(s["max"], 2),
     }
 
     print()
-    print(f"  Mean:   {mean_lat:6.1f} ms")
-    print(f"  Median: {median_lat:6.1f} ms")
-    print(f"  Stdev:  {stdev_lat:6.1f} ms")
-    print(f"  Min:    {min_lat:6.1f} ms")
-    print(f"  Max:    {max_lat:6.1f} ms")
+    print(f"  Mean:   {s['mean']:6.1f} ms")
+    print(f"  Median: {s['median']:6.1f} ms")
+    print(f"  Stdev:  {s['stdev']:6.1f} ms")
+    print(f"  Min:    {s['min']:6.1f} ms")
+    print(f"  Max:    {s['max']:6.1f} ms")
     print()
 
     return summary
@@ -101,20 +99,16 @@ def time_delay_mechanism(iterations: int = 20) -> dict[str, Any]:
     print("(Using scaled-down delays for benchmark: divide by 10)")
     print()
 
-    # Override the sleep function temporarily to use scaled delays
     import austria_job_scout.modules.fetcher as fetcher_module
     original_sleep = fetcher_module.time.sleep
 
     delays_ms = []
-    results = []
 
     def scaled_sleep(seconds):
-        # Scale down by 10x for benchmark
         scaled = seconds / 10.0
         start = time.perf_counter()
         original_sleep(scaled)
-        actual = (time.perf_counter() - start) * 1000
-        return actual
+        return (time.perf_counter() - start) * 1000
 
     fetcher_module.time.sleep = scaled_sleep
 
@@ -124,35 +118,29 @@ def time_delay_mechanism(iterations: int = 20) -> dict[str, Any]:
             _sleep_like_human()
             elapsed_ms = (time.perf_counter() - start) * 1000
             delays_ms.append(elapsed_ms)
-            results.append({"iteration": i, "delay_ms": round(elapsed_ms, 2)})
             print(f"  [{i}/{iterations}] {elapsed_ms:6.1f} ms")
     finally:
         fetcher_module.time.sleep = original_sleep
 
-    mean_delay = statistics.mean(delays_ms)
-    median_delay = statistics.median(delays_ms)
-    stdev_delay = statistics.stdev(delays_ms) if len(delays_ms) > 1 else 0
-
-    # Count long pauses (should be ~15% of iterations)
-    long_pause_threshold_ms = 6000  # 600ms = 6s scaled
+    s = _stats(delays_ms)
+    long_pause_threshold_ms = 6000
     long_pauses = sum(1 for d in delays_ms if d > long_pause_threshold_ms)
     long_pause_pct = (long_pauses / iterations) * 100
 
     summary = {
         "iterations": iterations,
-        "mean_ms": round(mean_delay, 2),
-        "median_ms": round(median_delay, 2),
-        "stdev_ms": round(stdev_delay, 2),
+        "mean_ms": round(s["mean"], 2),
+        "median_ms": round(s["median"], 2),
+        "stdev_ms": round(s["stdev"], 2),
         "long_pause_count": long_pauses,
         "long_pause_pct": round(long_pause_pct, 1),
         "expected_long_pause_pct": 15.0,
-        "samples": results,
     }
 
     print()
-    print(f"  Mean:              {mean_delay:6.1f} ms")
-    print(f"  Median:            {median_delay:6.1f} ms")
-    print(f"  Stdev:             {stdev_delay:6.1f} ms")
+    print(f"  Mean:              {s['mean']:6.1f} ms")
+    print(f"  Median:            {s['median']:6.1f} ms")
+    print(f"  Stdev:             {s['stdev']:6.1f} ms")
     print(f"  Long pauses:       {long_pauses}/{iterations} ({long_pause_pct:.1f}%, expected ~15%)")
     print()
 
@@ -183,19 +171,15 @@ def run_full_pipeline_benchmark(role: str, tmp_db: Path) -> dict[str, Any]:
 
     timings = {}
 
-    # 1. db-init
     print("  [1/4] Initializing database...")
     timings["db_init"] = benchmark_cli_command(["db-init"], tmp_db)
     print(f"        {timings['db_init']['elapsed_ms']:.1f} ms")
 
-    # 2. ingest
     print("  [2/4] Ingesting role...")
     ingest_result = benchmark_cli_command(["ingest", "--role", role, "--save"], tmp_db)
     timings["ingest"] = ingest_result
     print(f"        {ingest_result['elapsed_ms']:.1f} ms")
 
-    # Note: discover, fetch, index would require JSON piping between commands
-    # For a real benchmark, the user should run the pipeline command
     print("  [3/4] Discover/Fetch/Index... (requires full pipeline run)")
     print("  [4/4] Use `austria-job-scout pipeline --role '...'` for end-to-end")
 

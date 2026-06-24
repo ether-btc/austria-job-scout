@@ -2,9 +2,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-
-import pytest
 
 from austria_job_scout.benchmark import (
     time_delay_mechanism,
@@ -19,13 +16,12 @@ def test_embedding_benchmark_runs():
     assert result["iterations"] == 3
     assert result["mean_ms"] >= 0
     assert result["median_ms"] >= 0
-    assert len(result["samples"]) == 3
-    assert all("iteration" in s and "latency_ms" in s for s in result["samples"])
+    assert result["min_ms"] >= 0
+    assert result["max_ms"] >= 0
 
 
 def test_embedding_benchmark_json_output(tmp_path):
     """Embedding benchmark can write JSON output."""
-    from austria_job_scout import cli
     import sys
     
     output_file = tmp_path / "benchmark.json"
@@ -34,7 +30,7 @@ def test_embedding_benchmark_json_output(tmp_path):
     sys.argv = ["benchmark", "--embedding-only", "--iterations", "3", "--json", "--out", str(output_file)]
     
     from austria_job_scout.benchmark import main
-    result = main()
+    main()
     
     assert output_file.exists()
     data = json.loads(output_file.read_text())
@@ -52,7 +48,6 @@ def test_delay_benchmark_runs():
     assert result["stdev_ms"] > 0  # Should have variance due to long-tail
     assert result["long_pause_count"] >= 0
     assert result["long_pause_pct"] >= 0
-    assert len(result["samples"]) == 10
 
 
 def test_delay_benchmark_long_tail_distribution():
@@ -66,4 +61,5 @@ def test_delay_benchmark_long_tail_distribution():
 
 
 if __name__ == "__main__":
+    import pytest
     pytest.main([__file__, "-v"])
