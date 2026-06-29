@@ -189,6 +189,8 @@ def test_fetch_no_navigation_no_targets_returns_zero(tmp_db, capsys, monkeypatch
     monkeypatch.setattr("austria_job_scout.config.AGGRESSIVE_MODE", False)
     monkeypatch.setattr("austria_job_scout.modules.fetcher._http_get",
                         lambda *a, **kw: ("<html></html>", 200, None))
+    monkeypatch.setattr("austria_job_scout.modules.fetcher._sleep_like_human",
+                        lambda: None)
     _run(["db-init", "--db", str(tmp_db)])
     capsys.readouterr()
     rc = _run(["fetch", "--targets", "[]", "--db", str(tmp_db)])
@@ -202,6 +204,8 @@ def test_fetch_records_in_fetch_log(tmp_db, capsys, monkeypatch):
     monkeypatch.setattr("austria_job_scout.config.AGGRESSIVE_MODE", False)
     monkeypatch.setattr("austria_job_scout.modules.fetcher._http_get",
                         lambda *a, **kw: ("<html></html>", 200, None))
+    monkeypatch.setattr("austria_job_scout.modules.fetcher._sleep_like_human",
+                        lambda: None)
     _run(["db-init", "--db", str(tmp_db)])
     capsys.readouterr()
     targets = [{

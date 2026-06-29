@@ -146,10 +146,27 @@ def jobs_at_search_urls(reference) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def ams_search_urls(reference) -> list[dict]:
-    """AMS eJob-Room — Austria's public employment service.
+    """AMS "alle jobs" — Austria's public employment service.
 
-    Free, OGD data feeds exist via data.gv.at. v1 just points at the search
-    page; iter-3 will wire the JSON feed."""
+    The SPA at https://jobs.ams.at/public/emps/ is backed by a REST API at
+    ``/public/emps/api/`` (endpoints: ``/search``, ``/frontend/predefined-searches``,
+    ``/open/v1/suggestions/jobtitle``, ``/open/v1/suggestions/location``).
+    The API requires session auth (SM2_SESSION cookie + XSRF-TOKEN), making
+    direct curl scraping impossible without a browser session.
+
+    However, individual job detail pages are publicly accessible via their UUID:
+    ``https://jobs.ams.at/public/emps/jobs/uuid/{uuid}`` (HTTP 200, server-side HTML).
+
+    For programmatic search, two viable paths exist:
+      1. Parse.bot marketplace API ($0-30/mo, managed wrapper)
+      2. Apify lexis-solutions/jobs-ams-at-scraper (managed actor)
+
+    This function returns the public SPA search URL as a Tier-2 target.
+    The fetcher will get the Angular shell HTML (no server-side results — those
+    load via XHR after JS execution). For structured data extraction, use the
+    parse.bot or Apify managed APIs instead. The job-detail UUID URLs are the
+    fallback for direct content access.
+    """
     role = getattr(reference, "role_query", None) or getattr(reference, "title", None) or ""
     if not role:
         return []
@@ -157,12 +174,16 @@ def ams_search_urls(reference) -> list[dict]:
     return [{
         "ats": "ams_ogd",
         "source_kind": "aggregator_query",
-        "url": f"https://www.ams.at/jobroom/list?keyword={quote_plus(role, safe='')}",
+        "url": f"https://jobs.ams.at/public/emps/?q={quote_plus(role, safe='')}",
         "predicted_relevance": 0.5,
         "priority": SOURCE_PRIORITY.get("ams_ogd", 25),
         "language": "de",
         "role_query": role,
-        "notes": "AMS public job board; polite scraping permitted",
+        "notes": (
+            "AMS 'alle jobs' SPA. Direct API requires session auth. "
+            "Use parse.bot or Apify for structured search; job-detail UUID "
+            "pages are publicly accessible at /public/emps/jobs/uuid/{uuid}."
+        ),
     }] 
 
 

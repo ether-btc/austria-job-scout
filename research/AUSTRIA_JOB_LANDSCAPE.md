@@ -42,8 +42,22 @@ Compiled 2026-06-22. All citations inline. No fluff.
 ### Indeed.at
 - `at.indeed.com`. CF content-signals block LLM crawlers. Anti-bot: **strong.**
 
-### AMS / eJob-Room / "alle jobs" (public sector)
-- `ams.at` / `jobboerse.gv.at`. 210k applicant profiles. **OGD portal data feeds exist** (data.gv.at). **Highest priority for AT coverage.**
+### AMS / "alle jobs" (jobs.ams.at/public/emps/)
+- **Inventory**: Largest AT job board — ~210k listings aggregated from AMS, WKO, BA, BZ.
+- **URL**: `https://jobs.ams.at/public/emps/` — Angular SPA ("alle jobs - die Stellensuche des AMS").
+- **robots.txt**: Allows `/public/emps/$` (landing page only). Disallows `/public/emps/` deeper paths for `*`. **But**: `LinkedInBot` gets full Allow. Real-world: polite scraping tolerated.
+- **Backend API**: REST at `/public/emps/api/` — endpoints discovered from SPA JS bundle:
+  - `/search` — main search (keyword, location, radius, education, working_time, sort)
+  - `/frontend/predefined-searches` — homepage curated categories
+  - `/open/v1/suggestions/jobtitle` — typeahead
+  - `/open/v1/suggestions/location` — location typeahead
+- **API auth**: **Session-gated.** Returns 401 `{"code":"UNAUTHORIZED"}` without valid `SM2_SESSION` cookie + `X-XSRF-TOKEN`. The SPA obtains these via initial page load + Angular HttpXsrfInterceptor. Direct curl/requests cannot search.
+- **Job detail pages**: **Publicly accessible.** `https://jobs.ams.at/public/emps/jobs/uuid/{uuid}` returns server-side HTML (HTTP 200, no auth). UUIDs are v5 (namespace-based), e.g. `5c13494c-5c59-30f7-ba45-f0467410d2aa`.
+- **Managed API wrappers**:
+  - **Parse.bot** marketplace: 6 endpoints, free tier 100 calls/mo, $30/mo for 1k calls.
+  - **Apify** `lexis-solutions/jobs-ams-at-scraper`: managed actor, pay-per-result.
+- **Anti-bot**: **None.** Apache server, no Cloudflare/DataDome/Akamai. Session auth is the only gate.
+- **Verdict**: **Tier-1 priority for coverage** but requires either (a) headless browser for SPA session init, (b) managed API (parse.bot/Apify), or (c) UUID harvesting from another source + direct detail page fetch. The job-detail pages are the path of least resistance for content extraction.
 
 ### Aggregator summary
 
@@ -56,7 +70,7 @@ Compiled 2026-06-22. All citations inline. No fluff.
 | kimeta.at | 111.6k | ❌ | ❌ | Soft | Skip — meta |
 | hokify.at | medium | ❌ | unknown | Soft | Skip — niche |
 | Indeed.at | huge | ❌ | unknown | Cloudflare | Tier-3 |
-| **AMS / jobboerse.gv.at** | 210k | ✅ OGD | unknown | None | **Tier-1 priority** |
+| **AMS (jobs.ams.at)** | ~210k | session-gated | N/A | None | **Tier-1 coverage** (needs managed API or UUID detail pages) |
 | Monster.at | small | ❌ | unknown | Akamai | Skip |
 
 ## 2. Common ATS used by Austrian employers
@@ -163,7 +177,7 @@ Note: crt.sh omits the apex; run both `q={domain}` AND `q=%.{domain}`.
 
 ### Recommendations by source
 - **Greenhouse / Lever / SmartRecruiters / Personio XML / SuccessFactors XML**: pure HTTP. **Zero stealth.**
-- **AMS / jobboerse.gv.at**: polite scraper is fine.
+- **AMS (jobs.ams.at): NO WAF, but session-gated API.** No Cloudflare/DataDome. Backend REST API requires SM2_SESSION + XSRF token (Angular SPA init). Job-detail UUID pages are public HTML. Use parse.bot/Apify for search, or direct UUID fetch for details.
 - **karriere.at**: polite HTTP + rate-limit. Sitemap is highest ROI.
 - **jobs.at / kimeta / hokify**: headless browser only, low volume.
 - **willhaben.at / StepStone / Indeed**: stealth browser, cap per-IP, expect <50% success.
