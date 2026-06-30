@@ -85,7 +85,19 @@ class JobScoutPipeline:
 
         # Step 1: Ingest reference job
         logger.info("Step 1: Ingesting reference job...")
-        ref_job = ingest(reference_job)
+        # If it's a Path-like that doesn't exist on disk OR a non-path string,
+        # treat it as a role name (free-text). The CLI and programmatic callers
+        # pass roles; tests with PDF/TXT paths use the file path.
+        if isinstance(reference_job, (str, Path)) and str(reference_job).strip():
+            s = str(reference_job)
+            p = Path(s)
+            # Heuristic: if it looks like a path and exists on disk → file
+            if p.exists() and p.is_file():
+                ref_job = ingest(input_path=p)
+            else:
+                ref_job = ingest(role=s)
+        else:
+            ref_job = ingest(reference_job)
         if not ref_job:
             raise ValueError(f"Failed to ingest reference job from: {reference_job}")
 
@@ -136,7 +148,7 @@ class JobScoutPipeline:
             if resp.text is None or resp.status_code is None or resp.status_code >= 400:
                 continue
             ats = resp.ats_fingerprint or "unknown"
-            if any(a in ats for a in ["workday", "greenhouse", "lever", "smartrecruiters"]):
+            if any(a in ats for a in ["workday", "greenhouse", "lever", "smartrecruiters", "personio"]):
                 ats_job = extract_ats_html(resp.url, resp.text)
                 if ats_job:
                     extracted_jobs.append(ats_job)
@@ -144,6 +156,16 @@ class JobScoutPipeline:
                 agg_jobs = extract_aggregator_html(resp.url, resp.text)
                 if agg_jobs:
                     extracted_jobs.extend(agg_jobs)
+
+        # Dedupe by content_hash (title + company) — same job on two sources
+        from austria_job_scout.extractors.ats_extractor import dedupe_jobs
+        before_dedup = len(extracted_jobs)
+        extracted_jobs = dedupe_jobs(extracted_jobs)
+        if before_dedup != len(extracted_jobs):
+            logger.info(
+                "Dedup: %d jobs → %d unique (dropped %d duplicates)",
+                before_dedup, len(extracted_jobs), before_dedup - len(extracted_jobs),
+            )
 
         logger.info(f"Extracted {len(extracted_jobs)} jobs")
 

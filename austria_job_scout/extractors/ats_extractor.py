@@ -10,6 +10,7 @@ falls back to JSON-LD + script-var extraction.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -18,6 +19,22 @@ from xml.etree import ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
+
+
+def content_hash(title: str | None, company: str | None) -> str:
+    """Stable content-level dedup hash for a job.
+
+    Same job posted on two different ATS feeds (e.g. karriere.at and
+    Greenhouse) has the same title and company → same hash → dedupe.
+
+    Normalisation: lowercase, strip whitespace, collapse multi-space.
+    """
+    t = (title or "").lower().strip()
+    t = re.sub(r"\s+", " ", t)
+    c = (company or "").lower().strip()
+    c = re.sub(r"\s+", " ", c)
+    raw = f"{c}::{t}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -182,6 +199,28 @@ def _try_parse_xml(text: str | bytes) -> ET.Element | None:
         return ET.fromstring(text)
     except ET.ParseError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Content-level dedup
+# ---------------------------------------------------------------------------
+
+
+def dedupe_jobs(jobs: list[ATSJob]) -> list[ATSJob]:
+    """Drop jobs with the same (title, company) content hash.
+
+    The first occurrence wins; subsequent duplicates are skipped.
+    Returns the input list in order, with duplicates removed.
+    """
+    seen: set[str] = set()
+    out: list[ATSJob] = []
+    for j in jobs:
+        h = content_hash(j.title, j.company)
+        if h in seen:
+            continue
+        seen.add(h)
+        out.append(j)
+    return out
 
 
 # ---------------------------------------------------------------------------

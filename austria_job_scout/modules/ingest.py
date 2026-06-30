@@ -46,6 +46,11 @@ class ReferenceJob:
     role_query: Optional[str] = None           # canonical role name for aggregators
     language_queries: dict[str, str] = field(default_factory=dict)
     source_path: Optional[str] = None
+    url: Optional[str] = None                  # original URL if reference came from a posting
+    description: Optional[str] = None
+    seniority: Optional[str] = None
+    employment_type: Optional[str] = None
+    remote: bool = False
     parse_notes: list[str] = field(default_factory=list)   # warnings / "I guessed this"
 
     def to_dict(self) -> dict:
@@ -240,7 +245,7 @@ def _read_docx(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def ingest_input(
-    input_path: Optional[Path] = None,
+    input_path: Optional[Path | str] = None,
     role: Optional[str] = None,
 ) -> ReferenceJob:
     """Build a ReferenceJob from a file or a free-text role name.
