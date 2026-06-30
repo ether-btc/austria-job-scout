@@ -84,7 +84,6 @@ class RawResponse:
     error: str | None = None
     ats_fingerprint: str = "unknown"
     fetched_at: int = 0
-    from_cache: bool = False             # alias for `cached` (back-compat)
     # Was this request blocked before reaching the network?
     blocked_reason: str | None = None
 
@@ -343,7 +342,7 @@ def _fetch_one(target: dict, *, db_path: Optional[Path] = None,
             return RawResponse(
                 url=url, status_code=row["last_status"],
                 text=None,   # body not stored; downstream fetches can re-GET if needed
-                cached=True, from_cache=True,
+                cached=True,
                 fetched_at=int(row["last_checked"]),
             )
 

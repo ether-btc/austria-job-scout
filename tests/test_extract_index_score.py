@@ -174,19 +174,27 @@ def test_cli_extract_command_processes_response(tmp_path, capsys):
     out = json.loads(capsys.readouterr().out)
     assert isinstance(out, list)
 
-
 # ---------------------------------------------------------------------------
 # Pipeline import + API tests
 # ---------------------------------------------------------------------------
 
+
 def test_pipeline_imports_cleanly():
     """Pipeline module imports without errors."""
-    from austria_job_scout.modules.pipeline import JobScoutPipeline, run_pipeline
+    from austria_job_scout.modules.pipeline import JobScoutPipeline
     assert JobScoutPipeline is not None
-    assert run_pipeline is not None
 
 
-def test_pipeline_init_creates_indexer():
+def test_pipeline_class_api():
+    """JobScoutPipeline.run() can be called directly (no run_pipeline wrapper)."""
+    from austria_job_scout.modules.pipeline import JobScoutPipeline
+    # The old run_pipeline() wrapper was deleted (ponytail cleanup 2026-06-30).
+    # Users now instantiate the class directly:
+    #   pipeline = JobScoutPipeline(use_ml=False)
+    #   results = pipeline.run(reference_job="Senior Rust Engineer", ...)
+    pipeline = JobScoutPipeline(use_ml=False)
+    assert pipeline is not None
+    assert hasattr(pipeline, "run")
     """Pipeline.__init__ creates a JobIndexer."""
     from austria_job_scout.modules.pipeline import JobScoutPipeline
     pipeline = JobScoutPipeline(use_ml=False)

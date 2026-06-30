@@ -108,7 +108,7 @@ class JobScoutPipeline:
         targets = discover_targets(ref_job)
 
         # Apply budget limit
-        max_allowed = max_fetches or self._get_max_fetches()
+        max_allowed = max_fetches or config.MAX_FETCH_PER_RUN
         targets_to_fetch = targets[:max_allowed]
 
         logger.info("Found %d targets, fetching %d", len(targets), len(targets_to_fetch))
@@ -285,48 +285,9 @@ class JobScoutPipeline:
         logger.info("Pipeline completed successfully")
         return results
 
-    def _get_max_fetches(self) -> int:
-        """Get maximum fetches based on budget."""
-        return config.MAX_FETCH_PER_RUN
-
 
 # ---------------------------------------------------------------------------
 # Convenience function
 # ---------------------------------------------------------------------------
 
 
-def run_pipeline(
-    reference_job: Path | str,
-    output_dir: Path | str | None = None,
-    use_ml: bool = False,
-    max_fetches: int | None = None,
-    min_similarity: float = 0.5,
-    top_k: int = 10,
-    report_format: str = "text",
-    filters: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Run the full pipeline (convenience function).
-
-    Args:
-        reference_job: Path to PDF/docx/text file or role name string
-        output_dir: Directory to save reports
-        use_ml: If True, use sentence-transformers for embeddings
-        max_fetches: Maximum number of URLs to fetch
-        min_similarity: Minimum similarity score (0-1)
-        top_k: Number of top matches to report
-        report_format: Report format (text, json, csv, all)
-        filters: Optional filters
-
-    Returns:
-        Dictionary with pipeline results
-    """
-    pipeline = JobScoutPipeline(use_ml=use_ml)
-    return pipeline.run(
-        reference_job=reference_job,
-        output_dir=output_dir,
-        max_fetches=max_fetches,
-        min_similarity=min_similarity,
-        top_k=top_k,
-        report_format=report_format,
-        filters=filters,
-    )
