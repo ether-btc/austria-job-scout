@@ -378,7 +378,7 @@ def _fetch_one(target: dict, *, db_path: Optional[Path] = None,
     )
 
 
-def _wishlist_write(conn, targets: list[dict], reference_id: int = 0) -> int:
+def _wishlist_write(conn, targets: list[dict], reference_id: Optional[int] = 0) -> int:
     """Write overflow/blocked targets to the wishlist table.
 
     Idempotent: INSERT OR IGNORE on (reference_id, url).
@@ -418,7 +418,7 @@ def _wishlist_write(conn, targets: list[dict], reference_id: int = 0) -> int:
 
 def load_wishlist(
     db_path: Optional[Path] = None,
-    reference_id: int = 0,
+    reference_id: Optional[int] = 0,
     limit: int = 50,
 ) -> list[dict]:
     """Load pending wishlist targets for the next run.
@@ -489,7 +489,7 @@ def mark_wishlist_fetched(
 def fetch(targets: list[dict], *, db_path: Optional[Path] = None,
           navigation_noise: bool = True,
           max_fetches: int | None = None,
-          reference_id: int = 0) -> list[RawResponse]:
+          reference_id: Optional[int] = 0) -> list[RawResponse]:
     """Fetch a list of targets, in priority order. Honours per-run cap.
 
     Stops early if a target raises DailyBudgetExhausted — caller is expected

@@ -296,7 +296,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_started ON pipeline_runs(started_at);
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS wishlist (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-    reference_id          INTEGER NOT NULL REFERENCES reference_jobs(id) ON DELETE CASCADE,
+    reference_id          INTEGER REFERENCES reference_jobs(id) ON DELETE CASCADE,
     url                   TEXT NOT NULL,
     url_hash              TEXT NOT NULL,
     source_kind           TEXT NOT NULL,    -- 'ats_board' | 'aggregator_query' | 'sitemap' | 'career_path'
@@ -307,7 +307,7 @@ CREATE TABLE IF NOT EXISTS wishlist (
     fetched_at            INTEGER,          -- NULL until actually fetched
     wishlist_status       TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'fetched' | 'skipped' | 'wontfix'
     skip_reason           TEXT,             -- human-readable if status='skipped'
-    UNIQUE(reference_id, url)
+    UNIQUE(url)                              -- one row per URL globally; NULL reference_id is OK
 );
 CREATE INDEX IF NOT EXISTS idx_wishlist_ref_status ON wishlist(reference_id, wishlist_status);
 CREATE INDEX IF NOT EXISTS idx_wishlist_pending ON wishlist(wishlist_status, predicted_relevance DESC);

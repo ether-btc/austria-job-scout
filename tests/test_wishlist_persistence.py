@@ -49,17 +49,15 @@ def _seed_reference_job(db_path) -> int:
 
 
 def test_wishlist_persists_overflow_targets(tmp_db, monkeypatch, no_sleep):
-    """When max_fetches caps the run, remaining targets are persisted to wishlist."""
+    """When max_fetches caps the run, remaining targets are persisted to wishlist.
+    Works with NULL reference_id (no FK target required)."""
     db.init_db()
-    ref_id = _seed_reference_job(tmp_db)
     targets = _seed_targets(5)
     with patch.object(fetcher_mod, "_http_get", side_effect=_mock_http_ok):
         responses = fetcher_mod.fetch(
-            targets, db_path=tmp_db, navigation_noise=False,
-            max_fetches=2, reference_id=ref_id,
+            targets, db_path=tmp_db, navigation_noise=False, max_fetches=2,
         )
     assert len(responses) == 2
-    # The 3 remaining targets should be in the wishlist table
     with db.get_conn_ctx(tmp_db) as conn:
         n = conn.execute(
             "SELECT count(*) FROM wishlist WHERE wishlist_status='pending'"
@@ -71,15 +69,12 @@ def test_wishlist_persists_on_budget_exhaustion(tmp_db, monkeypatch, no_sleep):
     """When daily budget is exhausted, remaining targets go to wishlist."""
     monkeypatch.setattr(config, "DAILY_BUDGET_RESIDENTIAL", 2)
     db.init_db()
-    ref_id = _seed_reference_job(tmp_db)
     targets = _seed_targets(5)
     with patch.object(fetcher_mod, "_http_get", side_effect=_mock_http_ok):
         with pytest.raises(fetcher_mod.DailyBudgetExhausted):
             fetcher_mod.fetch(
-                targets, db_path=tmp_db, navigation_noise=False,
-                max_fetches=10, reference_id=ref_id,
+                targets, db_path=tmp_db, navigation_noise=False, max_fetches=10,
             )
-    # Budget exhaustion wrote remaining targets to wishlist
     with db.get_conn_ctx(tmp_db) as conn:
         n = conn.execute(
             "SELECT count(*) FROM wishlist WHERE wishlist_status='pending'"
@@ -90,18 +85,14 @@ def test_wishlist_persists_on_budget_exhaustion(tmp_db, monkeypatch, no_sleep):
 def test_load_wishlist_returns_pending_targets(tmp_db, monkeypatch, no_sleep):
     """load_wishlist() returns pending targets sorted by predicted_relevance."""
     db.init_db()
-    ref_id = _seed_reference_job(tmp_db)
     targets = _seed_targets(3)
-    # Persist directly via fetch overflow
     with patch.object(fetcher_mod, "_http_get", side_effect=_mock_http_ok):
         fetcher_mod.fetch(
-            targets, db_path=tmp_db, navigation_noise=False,
-            max_fetches=1, reference_id=ref_id,
+            targets, db_path=tmp_db, navigation_noise=False, max_fetches=1,
         )
 
-    loaded = fetcher_mod.load_wishlist(db_path=tmp_db, reference_id=ref_id)
+    loaded = fetcher_mod.load_wishlist(db_path=tmp_db)
     assert len(loaded) == 2
-    # All loaded targets have the required fields
     for t in loaded:
         assert "url" in t
         assert "ats" in t
@@ -111,14 +102,12 @@ def test_load_wishlist_returns_pending_targets(tmp_db, monkeypatch, no_sleep):
 def test_load_wishlist_respects_limit(tmp_db, monkeypatch, no_sleep):
     """load_wishlist(limit=N) returns at most N items."""
     db.init_db()
-    ref_id = _seed_reference_job(tmp_db)
     targets = _seed_targets(10)
     with patch.object(fetcher_mod, "_http_get", side_effect=_mock_http_ok):
         fetcher_mod.fetch(
-            targets, db_path=tmp_db, navigation_noise=False,
-            max_fetches=1, reference_id=ref_id,
+            targets, db_path=tmp_db, navigation_noise=False, max_fetches=1,
         )
-    loaded = fetcher_mod.load_wishlist(db_path=tmp_db, reference_id=ref_id, limit=3)
+    loaded = fetcher_mod.load_wishlist(db_path=tmp_db, limit=3)
     assert len(loaded) == 3
 
 
@@ -132,15 +121,12 @@ def test_load_wishlist_empty_when_nothing_pending(tmp_db):
 def test_mark_wishlist_fetched_updates_status(tmp_db, monkeypatch, no_sleep):
     """mark_wishlist_fetched() moves rows to 'fetched' state."""
     db.init_db()
-    ref_id = _seed_reference_job(tmp_db)
     targets = _seed_targets(3)
     with patch.object(fetcher_mod, "_http_get", side_effect=_mock_http_ok):
         fetcher_mod.fetch(
-            targets, db_path=tmp_db, navigation_noise=False,
-            max_fetches=1, reference_id=ref_id,
+            targets, db_path=tmp_db, navigation_noise=False, max_fetches=1,
         )
-    # Load, pick one URL, mark it fetched
-    loaded = fetcher_mod.load_wishlist(db_path=tmp_db, reference_id=ref_id)
+    loaded = fetcher_mod.load_wishlist(db_path=tmp_db)
     target_url = loaded[0]["url"]
     fetcher_mod.mark_wishlist_fetched(tmp_db, [target_url])
 
@@ -156,22 +142,32 @@ def test_mark_wishlist_fetched_updates_status(tmp_db, monkeypatch, no_sleep):
 def test_wishlist_idempotent_on_repeat_persist(tmp_db, monkeypatch, no_sleep):
     """Persisting the same target twice doesn't create duplicate rows."""
     db.init_db()
-    ref_id = _seed_reference_job(tmp_db)
     targets = _seed_targets(2)
     with patch.object(fetcher_mod, "_http_get", side_effect=_mock_http_ok):
         fetcher_mod.fetch(
-            targets, db_path=tmp_db, navigation_noise=False,
-            max_fetches=1, reference_id=ref_id,
+            targets, db_path=tmp_db, navigation_noise=False, max_fetches=1,
         )
-    # Run a second fetch with same targets still blocked
     with patch.object(fetcher_mod, "_http_get", side_effect=_mock_http_ok):
         fetcher_mod.fetch(
-            targets, db_path=tmp_db, navigation_noise=False,
-            max_fetches=1, reference_id=ref_id,
+            targets, db_path=tmp_db, navigation_noise=False, max_fetches=1,
         )
     with db.get_conn_ctx(tmp_db) as conn:
-        # The 1 overflowed target should be wishlisted only once (not 2x)
         n = conn.execute(
             "SELECT count(*) FROM wishlist WHERE url=?", (targets[1]["url"],)
         ).fetchone()[0]
     assert n == 1
+
+
+def test_wishlist_allows_null_reference_id(tmp_db, monkeypatch, no_sleep):
+    """Wishlist accepts targets without a reference_id (NULL FK)."""
+    db.init_db()
+    targets = _seed_targets(2)
+    with patch.object(fetcher_mod, "_http_get", side_effect=_mock_http_ok):
+        fetcher_mod.fetch(
+            targets, db_path=tmp_db, navigation_noise=False, max_fetches=1,
+        )
+    with db.get_conn_ctx(tmp_db) as conn:
+        n_null = conn.execute(
+            "SELECT count(*) FROM wishlist WHERE reference_id IS NULL"
+        ).fetchone()[0]
+    assert n_null == 1  # the 1 overflowed target has NULL ref_id
