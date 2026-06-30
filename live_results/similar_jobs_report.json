@@ -1,0 +1,39 @@
+{
+  "reference": {
+    "title": "Senior Rust Engineer",
+    "url": "N/A"
+  },
+  "summary": {
+    "total_matches": 1,
+    "avg_overall_score": 0.08,
+    "avg_title_similarity": 0.0,
+    "avg_skills_overlap": 0.2
+  },
+  "matches": [
+    {
+      "title": "Associate, Accounting",
+      "company": null,
+      "location": "Vienna, Vienna, Austria",
+      "url": "https://job-boards.eu.greenhouse.io/bitpanda/jobs/4880604101",
+      "scores": {
+        "overall": 0.08,
+        "title": 0.0,
+        "description": 0.0,
+        "skills": 0.2
+      },
+      "skills": [
+        "Git",
+        "Go",
+        "2+ years experience",
+        "Rust",
+        "REST"
+      ],
+      "details": {
+        "seniority": null,
+        "employment_type": null,
+        "remote": false,
+        "posted_date": "2026-06-03T09:42:54-04:00"
+      }
+    }
+  ]
+}
