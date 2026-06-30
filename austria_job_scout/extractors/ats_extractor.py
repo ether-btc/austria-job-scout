@@ -428,6 +428,132 @@ def _parse_smartrecruiters_json_job(data: dict[str, Any]) -> ATSJob | None:
 
 
 # ---------------------------------------------------------------------------
+# Personio XML extractor
+# ---------------------------------------------------------------------------
+
+
+def extract_personio(xml_or_html: str | bytes) -> list[ATSJob]:
+    """Extract jobs from Personio XML feed.
+
+    Personio publishes a public XML feed at ``{slug}.jobs.personio.de/xml``
+    with root element ``<workzag-jobs>`` containing ``<position>`` children.
+
+    Each ``<position>`` includes:
+      - ``<id>``, ``<name>`` (job title), ``<office>`` (location),
+        ``<jobDescriptions><jobDescription>`` (sections with name+value),
+        ``<employmentType>``, ``<schedule>``, ``<department>``,
+        ``<createdAt>``, ``<updatedAt>``
+    """
+    # Try XML first
+    root = _try_parse_xml(xml_or_html)
+    if root is not None:
+        return _parse_personio_xml(root)
+
+    # Fallback: Personio also has an HTML career page with JSON-LD
+    jobs: list[ATSJob] = []
+    json_ld = extract_json_ld(xml_or_html)
+    for item in json_ld:
+        job = parse_json_ld_job(item)
+        if job and "personio" in job.raw_json.get("url", "").lower():
+            job.source = "personio"
+            jobs.append(job)
+    return jobs
+
+
+def _parse_personio_xml(root: ET.Element) -> list[ATSJob]:
+    """Parse the <workzag-jobs> XML root into ATSJob objects."""
+    # Strip namespace if present
+    tag = root.tag
+    if "}" in tag:
+        tag = tag.split("}", 1)[1]
+
+    positions: list[ET.Element] = []
+    if tag == "workzag-jobs":
+        positions = list(root)
+    else:
+        # Maybe root IS a single position, or we need to search
+        positions = root.findall(".//position") or list(root)
+
+    jobs: list[ATSJob] = []
+    for pos in positions:
+        ptag = pos.tag.split("}", 1)[-1] if "}" in pos.tag else pos.tag
+        if ptag != "position":
+            continue
+        job = _parse_personio_position(pos)
+        if job:
+            jobs.append(job)
+    return jobs
+
+
+def _xml_text(elem: ET.Element | None, tag: str) -> str | None:
+    """Get text of the first child with the given tag (namespace-agnostic)."""
+    if elem is None:
+        return None
+    # Try direct find, then namespace-stripping find
+    child = elem.find(tag)
+    if child is None:
+        child = elem.find(f".//{{*}}{tag}")
+    if child is not None and child.text:
+        return child.text.strip()
+    return None
+
+
+def _parse_personio_position(pos: ET.Element) -> ATSJob | None:
+    """Parse one <position> element from the Personio XML feed."""
+    name = _xml_text(pos, "name")
+    if not name:
+        return None
+
+    pos_id = _xml_text(pos, "id") or ""
+    office = _xml_text(pos, "office") or ""
+    department = _xml_text(pos, "department")
+    employment = _xml_text(pos, "employmentType") or _xml_text(pos, "schedule")
+
+    # Build the job URL
+    slug = ""
+    # URL pattern: https://{slug}.jobs.personio.de/job/{id}
+    url = f"https://personio.de/job/{pos_id}" if pos_id else ""
+
+    # Extract description from <jobDescriptions>
+    description_parts: list[str] = []
+    job_descs = pos.find("jobDescriptions")
+    if job_descs is not None:
+        for jd in job_descs.findall("jobDescription"):
+            section_name = _xml_text(jd, "name") or ""
+            section_value = _xml_text(jd, "value") or ""
+            if section_value:
+                if section_name:
+                    description_parts.append(f"## {section_name}\n\n{section_value}")
+                else:
+                    description_parts.append(section_value)
+
+    description = "\n\n".join(description_parts) if description_parts else None
+    skills = _extract_skills_from_text(description or name)
+
+    # Build raw_json for compatibility with ATSJob dataclass
+    raw: dict[str, Any] = {
+        "id": pos_id,
+        "name": name,
+        "office": office,
+        "department": department,
+        "employmentType": employment,
+    }
+
+    return ATSJob(
+        source="personio",
+        url=url,
+        title=name,
+        company=None,  # Not in the XML; comes from the seed
+        location=office or None,
+        description=description,
+        employment_type=employment,
+        skills=skills,
+        posted_date=_xml_text(pos, "createdAt"),
+        raw_json=raw,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Universal extractor (dispatch)
 # ---------------------------------------------------------------------------
 
@@ -459,6 +585,8 @@ def extract_from_html(url: str, html: str) -> ATSJob | None:
         jobs = extract_lever(html)
     elif "smartrecruiters" in url.lower():
         jobs = extract_smartrecruiters(html)
+    elif "personio" in url.lower():
+        jobs = extract_personio(html)
     else:
         # Generic JSON-LD fallback
         json_ld = extract_json_ld(html)
