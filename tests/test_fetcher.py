@@ -307,7 +307,7 @@ def test_max_fetches_caps_run(tmp_db, monkeypatch, no_sleep):
     assert len(responses) == 1
     # The other 9 should be wishlisted (in last_blocked)
     blocked = fetcher_mod.fetch.last_blocked
-    assert any(b.get("reason") == "max_fetches_reached" for b in blocked)
+    assert any(b.get("_reason") == "max_fetches_reached" for b in blocked)
 
 
 def test_max_fetches_per_run_writes_wishlist_remainder(tmp_db, monkeypatch, no_sleep):

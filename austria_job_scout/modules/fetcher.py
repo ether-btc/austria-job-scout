@@ -378,17 +378,126 @@ def _fetch_one(target: dict, *, db_path: Optional[Path] = None,
     )
 
 
+def _wishlist_write(conn, targets: list[dict], reference_id: int = 0) -> int:
+    """Write overflow/blocked targets to the wishlist table.
+
+    Idempotent: INSERT OR IGNORE on (reference_id, url).
+    Returns the number of rows inserted.
+    """
+    if not targets:
+        return 0
+    now = int(time.time())
+    # FK constraint: reference_id must exist in reference_jobs, or be NULL.
+    # Use None when reference_id=0 (the default — no reference job persisted).
+    ref_id = reference_id if reference_id and reference_id > 0 else None
+    inserted = 0
+    for t in targets:
+        url = t.get("url") or ""
+        if not url:
+            continue
+        url_hash = _url_hash(url)
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO wishlist
+               (reference_id, url, url_hash, source_kind, ats, company_name,
+                predicted_relevance, wishlisted_at, wishlist_status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+            (
+                ref_id,
+                url,
+                url_hash,
+                t.get("source_kind", "unknown"),
+                t.get("ats"),
+                t.get("company_name"),
+                t.get("predicted_relevance", 0.0),
+                now,
+            ),
+        )
+        inserted += cur.rowcount
+    return inserted
+
+
+def load_wishlist(
+    db_path: Optional[Path] = None,
+    reference_id: int = 0,
+    limit: int = 50,
+) -> list[dict]:
+    """Load pending wishlist targets for the next run.
+
+    Returns targets sorted by predicted_relevance DESC, ready to pass
+    to fetch().
+    """
+    path = Path(db_path) if db_path else None
+    out: list[dict] = []
+    ref_id = reference_id if reference_id and reference_id > 0 else None
+    with db.get_conn_ctx(path) as conn:
+        if ref_id is not None:
+            rows = conn.execute(
+                """SELECT url, source_kind, ats, company_name,
+                          predicted_relevance, reference_id
+                   FROM wishlist
+                   WHERE wishlist_status = 'pending' AND reference_id = ?
+                   ORDER BY predicted_relevance DESC
+                   LIMIT ?""",
+                (ref_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT url, source_kind, ats, company_name,
+                          predicted_relevance, reference_id
+                   FROM wishlist
+                   WHERE wishlist_status = 'pending'
+                   ORDER BY predicted_relevance DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        for r in rows:
+            out.append({
+                "url": r["url"],
+                "source_kind": r["source_kind"],
+                "ats": r["ats"] or "unknown",
+                "company_name": r["company_name"],
+                "predicted_relevance": r["predicted_relevance"] or 0.5,
+                "priority": config.SOURCE_PRIORITY.get(r["ats"] or "", 30),
+                "from_wishlist": True,
+            })
+    return out
+
+
+def mark_wishlist_fetched(
+    db_path: Optional[Path],
+    urls: list[str],
+) -> None:
+    """Mark wishlist items as fetched after a successful pipeline run."""
+    if not urls:
+        return
+    path = Path(db_path) if db_path else None
+    now = int(time.time())
+    with db.get_conn_ctx(path) as conn:
+        for url in urls:
+            conn.execute(
+                """UPDATE wishlist
+                   SET wishlist_status = 'fetched', fetched_at = ?
+                   WHERE url = ? AND wishlist_status = 'pending'""",
+                (now, url),
+            )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def fetch(targets: list[dict], *, db_path: Optional[Path] = None,
           navigation_noise: bool = True,
-          max_fetches: int | None = None) -> list[RawResponse]:
+          max_fetches: int | None = None,
+          reference_id: int = 0) -> list[RawResponse]:
     """Fetch a list of targets, in priority order. Honours per-run cap.
 
     Stops early if a target raises DailyBudgetExhausted — caller is expected
     to wishlist the remainder and continue tomorrow.
+
+    Blocked targets (max_fetches reached, budget exhausted, exceptions) are
+    persisted to the ``wishlist`` table via ``_wishlist_write`` so the next
+    run can pick them up via ``load_wishlist``.
     """
     cap = max_fetches if max_fetches is not None else config.MAX_FETCH_PER_RUN
     out: list[RawResponse] = []
@@ -397,23 +506,38 @@ def fetch(targets: list[dict], *, db_path: Optional[Path] = None,
     for i, target in enumerate(targets):
         if len(out) >= cap:
             logger.info("max_fetches=%d reached; wishlisting the rest", cap)
-            blocked.append({"reason": "max_fetches_reached", "target": target})
+            blocked.append({**target, "_reason": "max_fetches_reached"})
             continue
         try:
             r = _fetch_one(target, db_path=db_path, navigation_noise=navigation_noise)
         except DailyBudgetExhausted as e:
             logger.warning("daily budget hit; aborting: %s", e)
-            blocked.append({"reason": "daily_budget_exhausted", "target": target, "detail": str(e)})
-            # Re-raise so the caller knows the run must stop (Pillar 0 rule 9:
-            # honest reporting — never silently die). The blocked list is
-            # accessible via fetch.last_blocked.
+            # Collect remaining targets for wishlist
+            remaining = targets[i:]
+            for t in remaining:
+                blocked.append({**t, "_reason": "daily_budget_exhausted", "_detail": str(e)})
+            # Persist all blocked to wishlist
+            path = Path(db_path) if db_path else None
+            with db.get_conn_ctx(path) as conn:
+                _wishlist_write(conn, blocked, reference_id=reference_id)
             fetch.last_blocked = blocked   # type: ignore[attr-defined]
             raise
         except Exception as e:
             logger.exception("fetcher crashed for %s", target.get("url"))
-            blocked.append({"reason": "exception", "target": target, "detail": str(e)})
+            blocked.append({**target, "_reason": "exception", "_detail": str(e)})
             continue
         out.append(r)
+
+    # Persist blocked targets to wishlist table
+    if blocked:
+        path = Path(db_path) if db_path else None
+        try:
+            with db.get_conn_ctx(path) as conn:
+                count = _wishlist_write(conn, blocked, reference_id=reference_id)
+                if count:
+                    logger.info("persisted %d targets to wishlist", count)
+        except Exception as e:
+            logger.warning("failed to write wishlist: %s", e)
 
     fetch.last_blocked = blocked   # type: ignore[attr-defined]
     return out
