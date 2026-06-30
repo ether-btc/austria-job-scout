@@ -1,10 +1,20 @@
-"""ATS extractors: JSON+LD parsing for Workday, Greenhouse, Lever, SmartRecruiters."""
+"""ATS extractors: JSON + XML + JSON-LD parsing for ATS job boards.
+
+Handles two response types:
+  - JSON API feeds (Greenhouse, Lever, SmartRecruiters, Personio XML)
+  - HTML pages with embedded JSON-LD (Workday, Greenhouse career pages)
+
+The dispatch logic in extract_from_html() auto-detects: if the body parses
+as JSON or XML, it goes through the structured parsers. If it's HTML, it
+falls back to JSON-LD + script-var extraction.
+"""
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from xml.etree import ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
@@ -151,35 +161,68 @@ def _parse_workday_job(data: dict[str, Any]) -> ATSJob | None:
     )
 
 
+def _try_parse_json(text: str | bytes) -> dict | list | None:
+    """Try to parse text as JSON. Returns None if not valid JSON."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    try:
+        data = json.loads(text)
+        if isinstance(data, (dict, list)):
+            return data
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
+def _try_parse_xml(text: str | bytes) -> ET.Element | None:
+    """Try to parse text as XML. Returns None if not valid XML."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    try:
+        return ET.fromstring(text)
+    except ET.ParseError:
+        return None
+
+
 # ---------------------------------------------------------------------------
-# Greenhouse-specific extractor
+# Greenhouse-specific extractor (JSON API + HTML fallback)
 # ---------------------------------------------------------------------------
 
 
-def extract_greenhouse(html: str | bytes) -> list[ATSJob]:
-    """Extract jobs from Greenhouse pages (structured JSON)."""
-    jobs = []
+def extract_greenhouse(html_or_json: str | bytes) -> list[ATSJob]:
+    """Extract jobs from Greenhouse.
 
-    # Greenhouse uses a global greenhouseData object
-    soup = BeautifulSoup(html, "lxml")
+    Handles two response types:
+      - JSON from boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true
+        → {"jobs": [{"id":..., "title":..., "absolute_url":..., "content":...}]}
+      - HTML career page with embedded JSON-LD
+    """
+    # Try JSON first — the API endpoint returns pure JSON
+    data = _try_parse_json(html_or_json)
+    if data is not None:
+        jobs_list = data if isinstance(data, list) else data.get("jobs", [])
+        parsed = [_parse_greenhouse_json_job(j) for j in jobs_list]
+        return [j for j in parsed if j is not None]
+
+    # Fallback to HTML + JSON-LD
+    jobs: list[ATSJob] = []
+    soup = BeautifulSoup(html_or_json, "lxml")
 
     for script in soup.find_all("script"):
         script_text = script.string or ""
         if "greenhouseData" in script_text or "Greenhouse" in script_text:
-            # Extract job listings
             json_matches = re.findall(r'\{[^{}]*(?:"title"[^{}]*"[^{}]*\})+[^{}]*\}', script_text)
             for match in json_matches:
                 try:
-                    data = json.loads(match)
-                    if "title" in data:
-                        job = _parse_greenhouse_job(data)
+                    d = json.loads(match)
+                    if "title" in d:
+                        job = _parse_greenhouse_job(d)
                         if job:
                             jobs.append(job)
                 except json.JSONDecodeError:
                     continue
 
-    # Fallback to JSON-LD
-    json_ld = extract_json_ld(html)
+    json_ld = extract_json_ld(html_or_json)
     for item in json_ld:
         job = parse_json_ld_job(item)
         if job and "greenhouse" in job.raw_json.get("url", "").lower():
@@ -189,8 +232,32 @@ def extract_greenhouse(html: str | bytes) -> list[ATSJob]:
     return jobs
 
 
+def _parse_greenhouse_json_job(data: dict[str, Any]) -> ATSJob | None:
+    """Parse a job dict from Greenhouse JSON API.
+
+    Key fields (from boards-api.greenhouse.io):
+      - id, title, updated_at, absolute_url, content (HTML),
+        location{name}, departments[], offices[],
+        employment (may be None), metadata[]
+    """
+    if not data.get("title"):
+        return None
+    return ATSJob(
+        source="greenhouse",
+        url=data.get("absolute_url") or "",
+        title=data.get("title"),
+        company=None,  # Greenhouse API doesn't include company name
+        location=data.get("location", {}).get("name") if isinstance(data.get("location"), dict) else None,
+        description=data.get("content"),
+        employment_type=data.get("employment"),
+        skills=_extract_skills_from_text(data.get("content") or ""),
+        posted_date=data.get("updated_at"),
+        raw_json=data,
+    )
+
+
 def _parse_greenhouse_job(data: dict[str, Any]) -> ATSJob | None:
-    """Parse a Greenhouse job data dict."""
+    """Parse a Greenhouse job from embedded HTML script data (legacy)."""
     return ATSJob(
         source="greenhouse",
         url=data.get("absolute_url") or "",
@@ -209,11 +276,24 @@ def _parse_greenhouse_job(data: dict[str, Any]) -> ATSJob | None:
 # ---------------------------------------------------------------------------
 
 
-def extract_lever(html: str | bytes) -> list[ATSJob]:
-    """Extract jobs from Lever pages (structured JSON)."""
-    jobs = []
+def extract_lever(html_or_json: str | bytes) -> list[ATSJob]:
+    """Extract jobs from Lever.
 
-    soup = BeautifulSoup(html, "lxml")
+    Handles two response types:
+      - JSON from api.lever.co/v0/postings/{token}?mode=json
+        → [{"id":..., "text":..., "hostedUrl":..., "descriptionPlain":...}]
+      - HTML career page with embedded JSON-LD
+    """
+    # Try JSON first
+    data = _try_parse_json(html_or_json)
+    if data is not None:
+        postings = data if isinstance(data, list) else data.get("postings", data.get("data", []))
+        parsed = [_parse_lever_json_job(j) for j in postings]
+        return [j for j in parsed if j is not None]
+
+    # Fallback to HTML + JSON-LD
+    jobs: list[ATSJob] = []
+    soup = BeautifulSoup(html_or_json, "lxml")
 
     for script in soup.find_all("script"):
         script_text = script.string or ""
@@ -231,7 +311,7 @@ def extract_lever(html: str | bytes) -> list[ATSJob]:
                     continue
 
     # Fallback to JSON-LD
-    json_ld = extract_json_ld(html)
+    json_ld = extract_json_ld(html_or_json)
     for item in json_ld:
         job = parse_json_ld_job(item)
         if job and "lever.co" in job.raw_json.get("url", "").lower():
@@ -241,8 +321,33 @@ def extract_lever(html: str | bytes) -> list[ATSJob]:
     return jobs
 
 
+def _parse_lever_json_job(data: dict[str, Any]) -> ATSJob | None:
+    """Parse a posting from Lever JSON API.
+
+    Key fields (from api.lever.co/v0/postings/{token}?mode=json):
+      - id, text (title), hostedUrl, description (HTML),
+        descriptionPlain (text), applyUrl,
+        categories{commitment, location, team, allLocations},
+        createdAt
+    """
+    if not data.get("text"):
+        return None
+    return ATSJob(
+        source="lever",
+        url=data.get("hostedUrl") or "",
+        title=data.get("text"),
+        company=None,
+        location=data.get("categories", {}).get("location") if isinstance(data.get("categories"), dict) else None,
+        description=data.get("descriptionPlain") or data.get("description"),
+        employment_type=data.get("categories", {}).get("commitment") if isinstance(data.get("categories"), dict) else None,
+        skills=_extract_skills_from_text(data.get("descriptionPlain") or data.get("description") or ""),
+        posted_date=data.get("createdAt"),
+        raw_json=data,
+    )
+
+
 def _parse_lever_job(data: dict[str, Any]) -> ATSJob | None:
-    """Parse a Lever job data dict."""
+    """Parse a Lever job from embedded HTML script data (legacy)."""
     return ATSJob(
         source="lever",
         url=data.get("hostedUrl") or "",
@@ -261,12 +366,24 @@ def _parse_lever_job(data: dict[str, Any]) -> ATSJob | None:
 # ---------------------------------------------------------------------------
 
 
-def extract_smartrecruiters(html: str | bytes) -> list[ATSJob]:
-    """Extract jobs from SmartRecruiters pages (structured JSON)."""
-    jobs = []
+def extract_smartrecruiters(html_or_json: str | bytes) -> list[ATSJob]:
+    """Extract jobs from SmartRecruiters.
 
-    # SmartRecruiters uses JSON-LD heavily
-    json_ld = extract_json_ld(html)
+    Handles two response types:
+      - JSON from api.smartrecruiters.com/v1/companies/{token}/postings
+        → {"content": [{"id":..., "title":..., "location":{...}, ...}]}
+      - HTML career page with JSON-LD
+    """
+    # Try JSON first
+    data = _try_parse_json(html_or_json)
+    if data is not None:
+        content = data.get("content", []) if isinstance(data, dict) else data
+        parsed = [_parse_smartrecruiters_json_job(j) for j in content]
+        return [j for j in parsed if j is not None]
+
+    # Fallback to JSON-LD
+    jobs: list[ATSJob] = []
+    json_ld = extract_json_ld(html_or_json)
     for item in json_ld:
         job = parse_json_ld_job(item)
         if job and "smartrecruiters" in job.raw_json.get("url", "").lower():
@@ -274,6 +391,40 @@ def extract_smartrecruiters(html: str | bytes) -> list[ATSJob]:
             jobs.append(job)
 
     return jobs
+
+
+def _parse_smartrecruiters_json_job(data: dict[str, Any]) -> ATSJob | None:
+    """Parse a posting from SmartRecruiters JSON API."""
+    if not data.get("title"):
+        return None
+    # SmartRecruiters location structure: {"city":..., "country":..., "region":...}
+    loc = data.get("location", {})
+    location_str = None
+    if isinstance(loc, dict):
+        parts = [str(loc.get(k)) for k in ("city", "region", "country") if loc.get(k)]
+        location_str = ", ".join(parts) if parts else None
+
+    # Apply URL construction
+    job_id = data.get("id", "")
+    company_id = data.get("company", {}).get("identifier", "") if isinstance(data.get("company"), dict) else ""
+    apply_url = f"https://jobs.smartrecruiters.com/{company_id}/{job_id}" if company_id and job_id else ""
+
+    return ATSJob(
+        source="smartrecruiters",
+        url=data.get("applyUrl") or apply_url,
+        title=data.get("title"),
+        company=data.get("company", {}).get("name") if isinstance(data.get("company"), dict) else None,
+        location=location_str,
+        description=data.get("jobAd", {}).get("sections", {}).get("jobDescription", {}).get("text")
+            if isinstance(data.get("jobAd"), dict) else None,
+        employment_type=data.get("typeOfEmployment", {}).get("label") if isinstance(data.get("typeOfEmployment"), dict) else None,
+        skills=_extract_skills_from_text(
+            (data.get("jobAd", {}).get("sections", {}).get("jobDescription", {}).get("text") or "")
+            if isinstance(data.get("jobAd"), dict) else ""
+        ),
+        posted_date=data.get("releasedDate"),
+        raw_json=data,
+    )
 
 
 # ---------------------------------------------------------------------------
