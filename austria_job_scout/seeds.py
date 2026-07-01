@@ -38,20 +38,24 @@ class SeedCompany:
 # Conservative seed list. ~30 entries — enough to populate TARGETS_PER_RUN
 # without over-fitting. Update by hand, verify before adding.
 SEED_AUSTRIAN_COMPANIES: tuple[SeedCompany, ...] = (
-    # --- Tier 1: ATS JSON endpoints we know the board token for ---
-    SeedCompany("Dynatrace",       "dynatrace.com",    ats="greenhouse",     board_token="dynatrace",   sector="observability"),
+    # --- Tier 1: ATS JSON endpoints (verified 2026-07-01) ---
+    # Austrian companies
     SeedCompany("Bitpanda",        "bitpanda.com",     ats="greenhouse",     board_token="bitpanda",    sector="crypto"),
-    SeedCompany("Sportradar",      "sportradar.com",   ats="greenhouse",     board_token="sportradar",  sector="sports-data"),
-    SeedCompany("Runtastic",       "runtastic.com",    ats="greenhouse",     board_token="adidas-run",  sector="fitness-tech"),
+    SeedCompany("Gropyus",         "gropyus.com",      ats="greenhouse",     board_token="gropyus",     sector="construction-tech"),
+    SeedCompany("Eversports",      "eversports.com",   ats="greenhouse",     board_token="eversports",  sector="sports-tech"),
+    SeedCompany("Bitmovin",        "bitmovin.com",     ats="greenhouse",     board_token="bitmovin",    sector="video-tech"),
+    SeedCompany("fal",             "fal.ai",           ats="greenhouse",     board_token="fal",         sector="ai"),
+    SeedCompany("Refurbed",        "refurbed.com",     ats="greenhouse",     board_token="refurbed",    sector="marketplace"),
     SeedCompany("Kinexon",         "kinexon.com",      ats="greenhouse",     board_token="kinexon",     sector="iot"),
-
-    # Personio XML (Tier 1, zero stealth)
-    SeedCompany("Celum",           "celum.com",        ats="personio",       board_token="celum",       sector="dam"),
-    SeedCompany("Blue Tomato",     "blue-tomato.com",  ats="personio",       board_token="bluetomato",  sector="ecommerce"),
-
-    # SmartRecruiters JSON
-    SeedCompany("XXXLutz",         "xxxlutz.at",       ats="smartrecruiters", board_token="XXXLutz",    sector="retail"),
-    SeedCompany("KIKA",            "kika.at",          ats="smartrecruiters", board_token="kika",       sector="retail"),
+    # DACH/European companies with Austrian offices or remote roles
+    SeedCompany("N26",             "n26.com",          ats="greenhouse",     board_token="n26",         sector="fintech"),
+    SeedCompany("Bybit",           "bybit.com",        ats="greenhouse",     board_token="bybit",       sector="crypto"),
+    SeedCompany("Tulip",           "tulip.com",        ats="greenhouse",     board_token="tulip",       sector="retail-tech"),
+    SeedCompany("Proton",          "proton.me",        ats="greenhouse",     board_token="proton",      sector="privacy"),
+    SeedCompany("Finanzcheck",     "finanzcheck.de",   ats="greenhouse",     board_token="finanzcheck", sector="fintech"),
+    SeedCompany("Hover",           "hover.to",         ats="greenhouse",     board_token="hover",       sector="prop-tech"),
+    # Lever boards
+    SeedCompany("Binance",         "binance.com",      ats="lever",          board_token="binance",     sector="crypto"),
 
     # --- Tier 2: aggregator-only (no known ATS token; rely on career-path probe) ---
     SeedCompany("Austrian Post",   "post.at",          ats=None, board_token=None, sector="public-sector"),

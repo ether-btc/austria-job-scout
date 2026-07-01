@@ -139,10 +139,11 @@ def test_known_ats_token_boosts_relevance():
     ref = _ref()
     targets = target_discovery.discover(ref, probe_seed_paths=False)
     by_url = {t["url"]: t for t in targets}
-    dynatrace = by_url.get("https://boards-api.greenhouse.io/v1/boards/dynatrace/jobs?content=true")
-    if dynatrace:
-        # Dynatrace is a known ATS — relevance should be >= 0.7
-        assert dynatrace["predicted_relevance"] >= 0.7
+    # Check a known-valid ATS board
+    bitpanda = by_url.get("https://boards-api.greenhouse.io/v1/boards/bitpanda/jobs?content=true")
+    if bitpanda:
+        # Bitpanda is a known ATS — relevance should be >= 0.7
+        assert bitpanda["predicted_relevance"] >= 0.7
 
 
 def test_banking_sector_penalized_for_rust_role():
@@ -157,8 +158,9 @@ def test_banking_sector_penalized_for_rust_role():
 
 
 def test_matching_sector_boosts_relevance():
-    ref = _ref(role="Senior Observability Engineer", skills=["Observability"])
-    seed = seedlib.by_name("Dynatrace")
+    ref = _ref(role="Senior Crypto Trader", skills=["Crypto"])
+    seed = seedlib.by_name("Bitpanda")
+    assert seed is not None
     rel = target_discovery._relevance_for_seed(seed, ref)
-    # 0.4 (base) + 0.3 (known ATS) + 0.2 (sector 'observability' matches) = 0.9
+    # 0.4 (base) + 0.3 (known ATS) + 0.2 (sector 'crypto' matches) = 0.9
     assert rel == pytest.approx(0.9)
