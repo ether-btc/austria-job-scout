@@ -215,8 +215,10 @@ def build_all_austrian_rss_targets(
 # Detection + extraction
 # ---------------------------------------------------------------------------
 
+# Pattern for RSS/Atom links in HTML (accepts any attribute order)
 _HTML_RSS_LINK_RE = re.compile(
-    r"""<link[^>]+rel=["']alternate["'][^>]+type=["']application/(?:rss|atom)\+xml["'][^>]*>""",
+    r"""<link[^>]+rel=["']alternate["'][^>]+type=["']application/(?:rss|atom)\+xml["'][^>]*>|"""
+    r"""<link[^>]+type=["']application/(?:rss|atom)\+xml["'][^>]+rel=["']alternate["'][^>]*>""",
     re.IGNORECASE,
 )
 
