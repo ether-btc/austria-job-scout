@@ -136,16 +136,38 @@ try:
     from scripts.stealth_fetch import stealth_fetch as _jrf_stealth_fetch  # type: ignore
     _HAS_JRF = True
     logger.info("jrf stealth_fetch loaded from %s", _JRF_PATH)
-except Exception as _e:   # ImportError, OSError, etc.
+except ImportError as _e:
     _jrf_stealth_fetch = None
     _HAS_JRF = False
     logger.warning(
-        "jrf stealth_fetch not available (%s). Falling back to vanilla "
+        "jrf stealth_fetch not available (ImportError: %s). Falling back to vanilla "
         "requests — curl_cffi TLS impersonation disabled. Run the "
-        "job-research-framework project locally, or set up a residential "
-        "proxy, before scraping CF-protected sites.",
-        _e,
+        "job-research-framework project locally, or set up a residential proxy, "
+        "before scraping CF-protected sites.", _e,
     )
+except OSError as _e:
+    _jrf_stealth_fetch = None
+    _HAS_JRF = False
+    logger.warning(
+        "jrf stealth_fetch not available (OSError: %s). Falling back to vanilla "
+        "requests — curl_cffi TLS impersonation disabled. Run the "
+        "job-research-framework project locally, or set up a residential proxy, "
+        "before scraping CF-protected sites.", _e,
+    )
+except Exception as _e:
+    # Programming error in stealth_fetch.py — log as ERROR
+    logger.error(
+        "jrf stealth_fetch failed to load due to unexpected error (%s: %s). "
+        "This indicates a bug in the stealth_fetch module itself. ",
+        type(_e).__name__, _e,
+    )
+    _jrf_stealth_fetch = None
+    _HAS_JRF = False
+
+
+# ---------------------------------------------------------------------------
+# Fetcher (Pillar 0: HTTP, fallback; stealth via JRF if available)
+# ---------------------------------------------------------------------------
 
 
 def _http_get(url: str, timeout: int = 30, impersonate: Optional[str] = "chrome120") -> tuple:
