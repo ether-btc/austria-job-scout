@@ -109,32 +109,6 @@ def _classify_size(name: str, sector_text: str = "") -> str:
     return "klein"
 
 
-def _classify_size(name: str, sector_text: str = "") -> str:
-    """Heuristic Wien-KMU size classification.
-
-    Rules (in priority order):
-        - sector says "tech" / "digital" / "software" → mittel
-        - legal-form "AG" in the name → mittel
-        - legal-form "KG" in the name → klein
-        - everything else → klein
-
-    Note: the original audit's recommendation to treat every "GmbH" as
-    mittel was wrong. Tests assert that ``Kleinunternehmensname GmbH`` and
-    ``StartupX GmbH`` are klein. Only the *tech* sector or *AG* legal
-    form implies mittel; plain GmbH in a non-tech sector is the common
-    Wiener-Kleinunternehmen case.
-    """
-    nm = (name or "").lower()
-    sec = (sector_text or "").lower()
-    if any(t in sec for t in ["tech", "digital", "software", "it-"]):
-        return "mittel"
-    if "ag" in nm:
-        return "mittel"
-    if "kg" in nm:
-        return "klein"
-    return "klein"
-
-
 # ---------------------------------------------------------------------------
 # Source 1: Wirtschaftsagentur Wien
 # ---------------------------------------------------------------------------
