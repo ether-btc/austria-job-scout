@@ -1,354 +1,488 @@
-"""Career page extractor — multi-job extraction from generic company career pages.
+"""RSS/Atom feed discovery + extraction for Austrian job sources.
 
-Most Austrian KMU career pages fall into one of these categories:
+Provides:
+  - URL builders for Austrian companies, aggregators, and Wien-specific sources
+  - RSS 2.0 / Atom feed parser (returns ATSJob + metadata)
+  - HTML autodetection via ``<link rel="alternate" type="application/rss+xml">``
+  - Target list builder for the pipeline (uses ``source_kind=rss_company`` /
+    ``rss_aggregator`` so the fetcher tier-orders them as RSS = Tier 2)
 
-1. **JSON-LD JobPosting** — schema.org/JobPosting blocks embedded in
-   ``<script type="application/ld+json">``. This is the gold standard:
-   structured, zero-guesswork, works for any CMS that supports schema.org
-   (WordPress, TYPO3, Drupal, custom).
-
-2. **RSS/Atom feed** — companies that publish ``/karriere/feed`` or
-   ``/jobs/rss``. XML, structured, zero-stealth.
-
-3. **Link-based extraction** — fallback: scan HTML for ``<a>`` tags whose
-   href contains ``/job/`` or ``/stellenangebote/`` and extract the link
-   text as a job title. Last resort; noisy but catches the long tail.
-
-This module provides ``extract_career_page_jobs()`` which tries all three
-strategies in order and returns a flat list of ATSJob objects.
-
-Designed to be Pillar 0-compliant: the pipeline already fetched the page
-body, so this function does NO network calls. It parses pre-fetched HTML.
+Designed for Pillar 0 safety: RSS/Atom are XML, no JavaScript, zero stealth.
+This module makes NO network calls — it only builds URLs and parses feeds
+that the fetcher has already retrieved.
 """
 from __future__ import annotations
 
 import logging
 import re
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
-from bs4 import BeautifulSoup
-
-from .ats_extractor import (
-    ATSJob,
-    _extract_skills_from_text,
-    _is_remote,
-    extract_json_ld,
-    parse_json_ld_job,
-)
+from ..extractors.ats_extractor import ATSJob, _extract_skills_from_text
 
 logger = logging.getLogger(__name__)
 
+# RSS source priority — Tier 2 (low detection risk, structured XML)
+# Lower number = try first. Matches the scale used in config.SOURCE_PRIORITY.
+RSS_PRIORITY = 30
+
 
 # ---------------------------------------------------------------------------
-# Strategy 1: JSON-LD JobPosting extraction (primary)
+# URL builders
 # ---------------------------------------------------------------------------
 
+# Common RSS feed URL patterns tried for Austrian companies.
+# Includes both `www.` and apex variants; tested for karriere.at, wienerjobs.at,
+# and small KMU CMS layouts (WordPress, TYPO3).
+_AUSTRIAN_COMPANY_FEED_PATTERNS = (
+    "/karriere/feed",
+    "/karriere/rss",
+    "/jobs/feed",
+    "/jobs/rss",
+    "/stellenangebote/feed",
+    "/stellenangebote/rss",
+    "/careers/feed",
+    "/careers/rss",
+    "/feed",
+    "/rss",
+    "/jobs.rss",
+    "/karriere.xml",
+)
 
-def extract_json_ld_jobs(html: str | bytes) -> list[ATSJob]:
-    """Extract ALL JobPosting JSON-LD blocks from an HTML page.
 
-    Unlike ``ats_extractor.extract_from_html()`` which returns only the
-    first match, this returns every JobPosting found — suitable for career
-    listing pages that list multiple positions.
+def _normalize_company_domain(domain: str) -> str:
+    """Strip scheme, leading 'www.', and trailing slash.
+
+    Accepts: 'techstartup.at', 'www.techstartup.at', 'http://techstartup.at'
+    Returns: 'techstartup.at'
     """
-    json_ld_blocks = extract_json_ld(html)
-    jobs: list[ATSJob] = []
-    
-    for block in json_ld_blocks:
-        try:
-            job = parse_json_ld_job(block)
-            if job is not None:
-                job.source = "career_json_ld"
-                jobs.append(job)
-        except Exception as e:
-            logger.warning("Failed to parse JSON-LD job: %s", e)
-            continue
-            
-    return jobs
+    d = (domain or "").strip()
+    if not d:
+        return ""
+    if "://" in d:
+        d = urlparse(d).hostname or d.split("://", 1)[1]
+    d = d.split("/", 1)[0]
+    if d.lower().startswith("www."):
+        d = d[4:]
+    return d
 
 
-# ---------------------------------------------------------------------------
-# Strategy 2: RSS/Atom feed extraction
-# ---------------------------------------------------------------------------
+def build_austrian_company_rss_urls(domain: str) -> list[str]:
+    """Build candidate RSS feed URLs for an Austrian company domain.
 
-
-def extract_rss_feed(xml_text: str | bytes) -> list[ATSJob]:
-    """Extract jobs from an RSS 2.0 or Atom XML feed.
-
-    Many Austrian companies publish job feeds at ``/karriere/feed`` or
-    ``/jobs/rss``. The feed items contain ``<title>``, ``<link>``, and
-    ``<description>`` — enough for a first-pass ATSJob.
-
-    Handles both:
-      - RSS 2.0: ``<rss><channel><item>...``
-      - Atom: ``<feed><entry>...``
+    Returns a list of URLs (https://) covering both `www.` and apex variants.
+    Always non-empty: a generic ``/feed`` is included as a final fallback.
     """
-    if isinstance(xml_text, bytes):
-        xml_text = xml_text.decode("utf-8", errors="replace")
-
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError as e:
-        logger.warning("Failed to parse RSS/XML: %s", e)
+    apex = _normalize_company_domain(domain)
+    if not apex:
         return []
 
-    # Strip XML namespaces for simpler matching
-    jobs: list[ATSJob] = []
+    urls: list[str] = []
+    for pattern in _AUSTRIAN_COMPANY_FEED_PATTERNS:
+        # Both www and apex variants
+        urls.append(f"https://www.{apex}{pattern}")
+        urls.append(f"https://{apex}{pattern}")
+    return urls
 
-    # RSS 2.0: <rss><channel><item>
-    items = root.findall(".//item")
-    if not items:
-        # Atom: <feed><entry>
-        try:
-            items = root.findall(".//{http://www.w3.org/2005/Atom}entry")
-        except ET.ParseError:
-            # Try namespace-agnostic
-            items = root.findall(".//entry")
-        if not items:
-            # Fallback: find any element that might contain job data
-            items = root.findall("./*")
 
-    for item in items:
-        try:
-            job = _parse_rss_item(item)
-            if job:
-                jobs.append(job)
-        except Exception as e:
-            logger.warning("Failed to parse RSS item: %s", e)
+def build_aggregator_rss_urls() -> list[str]:
+    """Build RSS feed URLs for Austrian job aggregators.
+
+    Includes karriere.at, stepstone (AT/DE), and standard aggregator feeds
+    that publish RSS for Austrian roles.
+    """
+    return [
+        # karriere.at — main aggregator
+        "https://www.karriere.at/rss",
+        "https://www.karriere.at/jobs/rss",
+        # StepStone AT — known to publish RSS for some categories
+        "https://www.stepstone.at/rss",
+        "https://www.stepstone.de/rss",
+        # StepStone specialised
+        "https://www.stepstone.at/stelle/rss",
+        "https://www.stepstone.de/stelle/rss",
+        # Wienerjobs (we mirror their search feed; they don't always expose RSS
+        # but listing common paths is cheap)
+        "https://www.wienerjobs.at/rss",
+        "https://www.wienerjobs.at/jobs/rss",
+    ]
+
+
+def build_wien_specific_rss_urls() -> list[str]:
+    """Build Wien-specific RSS feed URLs (city institutions + universities).
+
+    These are public-sector / educational sources — high-value, low-noise.
+    """
+    return [
+        # City of Wien / Wirtschaftsagentur Wien
+        "https://www.wien.gv.at/rss",
+        "https://www.wien.gv.at/feed",
+        "https://www.wirtschaftsagentur.at/rss",
+        "https://www.wirtschaftsagentur.at/feed",
+        "https://jobs.wien.gv.at/rss",
+        "https://jobs.wien.gv.at/feed",
+        # Universities — public, frequent, structured
+        "https://univie.ac.at/rss",
+        "https://univie.ac.at/jobs/rss",
+        "https://univie.ac.at/karriere/rss",
+        "https://www.tuwien.ac.at/rss",
+        "https://www.tuwien.ac.at/jobs/rss",
+        "https://www.tuwien.ac.at/karriere/rss",
+    ]
+
+
+def build_all_austrian_rss_targets(
+    seed_domains: list[str],
+    include_aggregators: bool = True,
+) -> list[dict[str, Any]]:
+    """Build a complete list of RSS feed targets for the pipeline.
+
+    Each target dict has:
+        - url: feed URL
+        - ats: 'rss'
+        - source_kind: 'rss_company' or 'rss_aggregator'
+        - company_name: extracted from domain (for company feeds)
+        - predicted_relevance: 0..1 heuristic
+        - priority: int ≤ 30 (Tier 2)
+
+    Caller passes the result to fetcher.fetch(); the fetcher tier-orders
+    by priority regardless of list order.
+    """
+    targets: list[dict[str, Any]] = []
+
+    # Company feeds — one target per (domain, pattern). Keep ALL variants
+    # because we don't know which path the company's CMS publishes to.
+    # Dedup later by URL.
+    for domain in seed_domains:
+        apex = _normalize_company_domain(domain)
+        if not apex:
             continue
+        for url in build_austrian_company_rss_urls(apex):
+            targets.append({
+                "url": url,
+                "ats": "rss",
+                "source_kind": "rss_company",
+                "company_name": apex,
+                "predicted_relevance": 0.6,
+                "priority": RSS_PRIORITY,
+            })
 
-    return jobs
+    if include_aggregators:
+        for url in build_aggregator_rss_urls():
+            targets.append({
+                "url": url,
+                "ats": "rss",
+                "source_kind": "rss_aggregator",
+                "company_name": None,
+                "predicted_relevance": 0.7,
+                "priority": RSS_PRIORITY,
+            })
+        for url in build_wien_specific_rss_urls():
+            targets.append({
+                "url": url,
+                "ats": "rss",
+                "source_kind": "rss_aggregator",
+                "company_name": None,
+                "predicted_relevance": 0.8,  # Wien-specific = high relevance for Wien users
+                "priority": RSS_PRIORITY,
+            })
+
+    # Dedup by URL — same feed can appear via multiple code paths.
+    # Also collapse www.apex/apex (different paths but same server); we keep
+    # one canonical URL per (host-no-www, path).
+    seen: set[tuple[str, str]] = set()
+    seen_full_url: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for t in targets:
+        if t["url"] in seen_full_url:
+            continue
+        parsed = urlparse(t["url"])
+        host = parsed.hostname or ""
+        if host.lower().startswith("www."):
+            host = host[4:]
+        key = (host.lower(), parsed.path)
+        if key in seen:
+            continue
+        seen.add(key)
+        seen_full_url.add(t["url"])
+        deduped.append(t)
+
+    return deduped
 
 
-def _xml_text_nons(elem: ET.Element, tag: str) -> str | None:
-    """Get child text, namespace-agnostic."""
-    # Direct tag
-    child = elem.find(tag)
+# ---------------------------------------------------------------------------
+# Detection + extraction
+# ---------------------------------------------------------------------------
+
+# Pattern for RSS/Atom links in HTML (accepts any attribute order)
+_HTML_RSS_LINK_RE = re.compile(
+    r"""<link[^>]+rel=["']alternate["'][^>]+type=["']application/(?:rss|atom)\+xml["'][^>]*>|"""
+    r"""<link[^>]+type=["']application/(?:rss|atom)\+xml["'][^>]+rel=["']alternate["'][^>]*>""",
+    re.IGNORECASE,
+)
+
+
+def is_rss_feed(content: str | bytes) -> bool:
+    """Return True if content looks like an RSS/Atom feed (or HTML linking one).
+
+    Works on:
+      - Raw RSS 2.0 XML
+      - Raw Atom XML
+      - HTML with ``<link rel="alternate" type="application/rss+xml" ...>``
+      - HTML with ``<link rel="alternate" type="application/atom+xml" ...>``
+    """
+    if not content:
+        return False
+    if isinstance(content, bytes):
+        try:
+            content = content.decode("utf-8", errors="replace")
+        except Exception:
+            return False
+
+    # Fast path — sniff the first 256 chars for raw XML signatures.
+    # Normalise leading whitespace because feeds are sometimes wrapped with
+    # newlines/spaces (e.g. when saved from email or curl with --data-binary).
+    head = content[:256].strip().lower()
+    if head.startswith("<?xml") or "<rss" in head or "<feed" in head:
+        return True
+
+    # HTML with <link rel="alternate"> pointing to an RSS/Atom feed
+    if "<link" in content.lower() and _HTML_RSS_LINK_RE.search(content):
+        return True
+
+    return False
+
+
+def get_rss_info(content: str | bytes) -> dict[str, Any]:
+    """Extract feed-level metadata from an RSS 2.0 or Atom feed.
+
+    Returns a dict with keys: type, title, link, description, language,
+    last_build_date, item_count. Returns ``{}`` on parse failure.
+    """
+    if not content:
+        return {}
+
+    if isinstance(content, bytes):
+        try:
+            content = content.decode("utf-8", errors="replace")
+        except Exception:
+            return {}
+
+    # Python's ElementTree is strict — XML declaration must be at byte 0.
+    # Strip leading/trailing whitespace so wrapped feeds parse cleanly.
+    parse_target = content.strip()
+    try:
+        root = ET.fromstring(parse_target)
+    except ET.ParseError as e:
+        logger.debug("get_rss_info: XML parse failed: %s", e)
+        return {}
+
+    # Detect feed type
+    tag = root.tag.split("}", 1)[-1].lower() if "}" in root.tag else root.tag.lower()
+    feed_type = "rss20" if tag == "rss" else "atom" if tag == "feed" else "unknown"
+
+    info: dict[str, Any] = {"type": feed_type}
+
+    if feed_type == "rss20":
+        channel = root.find("channel")
+        if channel is None:
+            return {}
+        info["title"] = _elem_text(channel, "title") or ""
+        info["link"] = _elem_text(channel, "link") or ""
+        info["description"] = _elem_text(channel, "description") or ""
+        info["language"] = _elem_text(channel, "language") or ""
+        info["last_build_date"] = _elem_text(channel, "lastBuildDate") or ""
+        info["item_count"] = len(channel.findall(".//item"))
+    elif feed_type == "atom":
+        # Atom: feed-level elements
+        info["title"] = _elem_text(root, "title") or ""
+        # Atom <link href="...">
+        link_elem = root.find("{*}link")
+        if link_elem is None:
+            link_elem = root.find(".//{*}link")
+        if link_elem is not None:
+            info["link"] = link_elem.get("href", "") or ""
+        else:
+            info["link"] = ""
+        info["description"] = _elem_text(root, "subtitle") or ""
+        info["language"] = _elem_text(root, "language") or ""
+        info["last_build_date"] = _elem_text(root, "updated") or ""
+        info["item_count"] = len(root.findall(".//{http://www.w3.org/2005/Atom}entry"))
+    else:
+        return {}
+
+    return info
+
+
+def extract_rss_jobs(content: str | bytes) -> list[ATSJob]:
+    """Parse RSS 2.0 or Atom feed and return a list of ATSJob objects.
+
+    Handles raw XML feeds and HTML pages that contain an RSS link.
+    Returns [] on parse failure or empty feeds.
+    """
+    if not content:
+        return []
+
+    if isinstance(content, bytes):
+        try:
+            content = content.decode("utf-8", errors="replace")
+        except Exception:
+            return []
+
+    # If this is HTML with an RSS link, the actual feed isn't here — return []
+    # The caller should follow the link separately.
+    # ``.strip()`` (not ``.lstrip()``) — the test wraps feeds with trailing
+    # newlines and our sniff must work either way.
+    head = content[:256].strip().lower()
+    if not (head.startswith("<?xml") or "<rss" in head or "<feed" in head):
+        return []
+
+    # Python's ElementTree is strict — XML declaration must be at byte 0.
+    # Test fixtures wrap feeds in surrounding whitespace; strip before parsing
+    # but preserve the actual payload.
+    parse_target = content.strip()
+    try:
+        root = ET.fromstring(parse_target)
+    except ET.ParseError as e:
+        logger.debug("extract_rss_jobs: XML parse failed: %s", e)
+        return []
+
+    # Detect feed type
+    tag = root.tag.split("}", 1)[-1].lower() if "}" in root.tag else root.tag.lower()
+    if tag == "rss":
+        return _extract_rss20(root)
+    if tag == "feed":
+        return _extract_atom(root)
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+_ATOM_NS = "{http://www.w3.org/2005/Atom}"
+
+
+def _elem_text(parent: ET.Element | None, tag: str) -> str | None:
+    """Get first child text matching ``tag``, namespace-agnostic. Returns None."""
+    if parent is None:
+        return None
+    child = parent.find(tag)
     if child is None:
-        # Namespace wildcard
-        child = elem.find(f".//{{*}}{tag}")
+        child = parent.find(f".//{{*}}{tag}")
     if child is not None and child.text:
         return child.text.strip()
     return None
 
 
-def _parse_rss_item(elem: ET.Element) -> ATSJob | None:
-    """Parse one <item> or <entry> element into an ATSJob."""
-    title = _xml_text_nons(elem, "title")
-    link = _xml_text_nons(elem, "link")
-    if not link:
-        # Atom <link href="...">
-        link_elem = elem.find("{*}link")
-        if link_elem is not None:
-            link = link_elem.get("href", "")
+def _company_from_feed_title(title: str) -> str | None:
+    """Extract a clean company name from a feed title.
 
+    Strips trailing descriptors like "Karriere", "Jobs", "Stellenangebote",
+    " - Jobs", "| Wien", etc. Returns None if title is empty or unparseable.
+    """
     if not title:
         return None
-
-    description = _xml_text_nons(elem, "description") or _xml_text_nons(elem, "summary")
-    skills = _extract_skills_from_text(description or title)
-
-    # Extract date
-    posted = _xml_text_nons(elem, "pubDate") or _xml_text_nons(elem, "published") or _xml_text_nons(elem, "updated")
-
-    return ATSJob(
-        source="career_rss",
-        url=link or "",
-        title=title,
-        description=description,
-        skills=skills,
-        posted_date=posted,
+    t = title.strip()
+    # Remove common trailing suffixes (case-insensitive)
+    t = re.sub(
+        r"\s*[\(\|]\s*.*$",  # anything in parens or after pipe
+        "",
+        t,
+        flags=re.IGNORECASE,
     )
+    t = re.sub(
+        r"\s*[-\u2013\u2014|]\s*(karriere|jobs?|stellenangebote|"
+        r"careers?|offene\s+stellen)\s*$",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    # If title is something like "Tech Startup GmbH Karriere", strip "Karriere"
+    t = re.sub(
+        r"\s+(karriere|jobs?|stellenangebote|careers?)\s*$",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = t.strip(" -|\t")
+    return t or None
 
 
-# ---------------------------------------------------------------------------
-# Strategy 3: Link-based extraction (fallback)
-# ---------------------------------------------------------------------------
+def _extract_rss20(root: ET.Element) -> list[ATSJob]:
+    """Parse RSS 2.0 <channel><item> entries into ATSJob objects."""
+    channel = root.find("channel")
+    if channel is None:
+        return []
+    company = _company_from_feed_title(_elem_text(channel, "title") or "")
 
-# CSS selectors for job-related links on Austrian career pages.
-# Ordered by specificity: German paths first, then English.
-_JOB_LINK_SELECTORS = (
-    "a[href*='/job/']",
-    "a[href*='/jobs/']",
-    "a[href*='/stellenangebote/']",
-    "a[href*='/stellenanzeige/']",
-    "a[href*='/karriere/']",
-    "a[href*='/position/']",
-    "a[href*='/open-positions/']",
-    "a[href*='/careers/opening']",
-    "a[href*='/bewerbung/']",
-)
-
-# Title-like containers near job links
-_TITLE_SELECTORS = "h2, h3, h4, .job-title, .position-title, .stellenanzeige-title"
-
-
-def extract_link_based_jobs(html: str | bytes, base_url: str, company: str = "") -> list[ATSJob]:
-    """Extract jobs by scanning for job-related <a> tags.
-
-    This is the fallback when JSON-LD and RSS are unavailable. It finds
-    links whose href contains job-related path segments, then attempts to
-    extract the title from the link text or a nearby heading.
-    """
-    soup = BeautifulSoup(html, "lxml")
-
-    # Combine all selectors into one query
-    all_links: list[Any] = []
-    for selector in _JOB_LINK_SELECTORS:
-        all_links.extend(soup.select(selector))
-
-    # Deduplicate by href
-    seen_hrefs: set[str] = set()
     jobs: list[ATSJob] = []
-
-    for link in all_links:
-        href = link.get("href", "")
-        if not href or "#" in href or "javascript:" in href:
+    for item in channel.findall(".//item"):
+        title = _elem_text(item, "title")
+        link = _elem_text(item, "link")
+        if not title:
             continue
-
-        full_url = urljoin(base_url, href)
-        if full_url in seen_hrefs:
-            continue
-        seen_hrefs.add(full_url)
-
-        # Extract title from link text
-        title = link.get_text(strip=True)
-        if not title or len(title) < 5 or len(title) > 200:
-            # Try parent or sibling
-            parent = link.find_parent()
-            if parent:
-                title_elem = parent.select_one(_TITLE_SELECTORS)
-                if title_elem:
-                    title = title_elem.get_text(strip=True)
-
-        if not title or len(title) < 5:
-            continue
-
-        # Skip navigation/utility links
-        _NAVIGATION_SKIP = {
-            "alle jobs", "all jobs", "mehr", "more", "weiter", "continue",
-            "bewerben", "apply", "zurück", "back", "filter", "sortieren",
-            "anzeigen", "show", "suchen", "search", "seite", "page",
-            "nächste", "next", "vorherige", "previous",
-        }
-        title_lower = title.lower().strip()
-        if title_lower in _NAVIGATION_SKIP:
-            continue
-
-        # Skip bare navigation links with no meaningful job title
-        _NAVIGATION_TEXT_PATTERNS = (
-            r"^alle anzeigen$", r"^more jobs?$", r"^show jobs?$", r"^job \d+$",
-            r"^position \d+$", r"^open position$", r"^view job$", r"^details$",
-            r"^job listing$", r"^job postings$", r"^vacancies$",
+        description = _elem_text(item, "description")
+        posted = (
+            _elem_text(item, "pubDate")
+            or _elem_text(item, "published")
+            or _elem_text(item, "updated")
         )
-        if any(re.match(pattern, title_lower, re.IGNORECASE) for pattern in _NAVIGATION_TEXT_PATTERNS):
-            continue
-
+        skills = _extract_skills_from_text(description or title)
         jobs.append(ATSJob(
-            source="career_link",
-            url=full_url,
+            source="rss_rss20",
+            url=link or "",
             title=title,
-            company=company or None,
+            company=company,
+            description=description,
+            skills=skills,
+            posted_date=posted,
         ))
-
     return jobs
 
 
-# ---------------------------------------------------------------------------
-# Master extraction function (dispatch)
-# ---------------------------------------------------------------------------
+def _extract_atom(root: ET.Element) -> list[ATSJob]:
+    """Parse Atom <feed><entry> elements into ATSJob objects."""
+    feed_title = _elem_text(root, "title") or ""
+    company = _company_from_feed_title(feed_title)
 
+    entries = root.findall(f".//{_ATOM_NS}entry")
+    if not entries:
+        entries = root.findall(".//entry")
 
-def extract_career_page_jobs(
-    html: str | bytes,
-    base_url: str,
-    company: str = "",
-) -> list[ATSJob]:
-    """Extract all jobs from a career page, trying multiple strategies.
-
-    Strategy order (first non-empty result wins):
-      1. JSON-LD JobPosting blocks (structured, most reliable)
-      2. RSS/Atom XML feed (if the page IS a feed)
-      3. Link-based extraction (fallback, noisy)
-
-    Returns a deduplicated list of ATSJob objects.
-    """
-    # Strategy 1: JSON-LD
-    jobs = extract_json_ld_jobs(html)
-    if jobs:
-        logger.debug("career_page_extractor: JSON-LD found %d jobs for %s", len(jobs), company)
-        return jobs
-
-    # Strategy 2: RSS (only if the content looks like XML)
-    if isinstance(html, bytes):
-        peek = html[:200].decode("utf-8", errors="replace").strip()
-    else:
-        peek = html[:200].strip()
-
-    if peek.startswith("<?xml") or "<rss" in peek or "<feed" in peek:
-        rss_jobs = extract_rss_feed(html)
-        if rss_jobs:
-            logger.debug("career_page_extractor: RSS found %d jobs for %s", len(rss_jobs), company)
-            return rss_jobs
-
-    # Strategy 3: Link-based fallback
-    link_jobs = extract_link_based_jobs(html, base_url, company)
-    if link_jobs:
-        logger.debug("career_page_extractor: link-based found %d jobs for %s", len(link_jobs), company)
-    return link_jobs
-
-
-# ---------------------------------------------------------------------------
-# Sitemap job discovery
-# ---------------------------------------------------------------------------
-
-
-def extract_jobs_from_sitemap(xml_text: str | bytes, base_url: str = "") -> list[str]:
-    """Extract job URLs from a sitemap.xml.
-
-    Many companies expose ``/sitemap.xml`` or ``/karriere/sitemap.xml``
-    with job detail page URLs. This function returns a list of URLs that
-    look like job detail pages (containing ``/job/``, ``/stellen/``, etc.).
-
-    The pipeline can then fetch each URL individually for JSON-LD extraction.
-    """
-    if isinstance(xml_text, bytes):
-        xml_text = xml_text.decode("utf-8", errors="replace")
-
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return []
-
-    # Standard sitemap namespace
-    ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-
-    urls: list[str] = []
-    # Try with namespace
-    for url_elem in root.findall(".//sm:url", ns):
-        loc = url_elem.find("sm:loc", ns)
-        if loc is not None and loc.text:
-            urls.append(loc.text.strip())
-
-    # Fallback: no namespace
-    if not urls:
-        for url_elem in root.findall(".//{*}url"):
-            loc = url_elem.find("{*}loc")
-            if loc is not None and loc.text:
-                urls.append(loc.text.strip())
-
-    # Filter to only job-related URLs
-    job_patterns = re.compile(
-        r"/job/|/jobs/|/stellen|/position/|/careers/|/karriere/|/bewerbung/",
-        re.I,
-    )
-    job_urls = [u for u in urls if job_patterns.search(u)]
-
-    if base_url and not job_urls:
-        # If no job-pattern URLs found, return all URLs (maybe the sitemap
-        # is already filtered to jobs only)
-        return urls
-
-    return job_urls
+    jobs: list[ATSJob] = []
+    for entry in entries:
+        title = _elem_text(entry, "title")
+        if not title:
+            continue
+        # Atom <link href="...">
+        link = _elem_text(entry, "link")
+        if not link:
+            link_elem = entry.find(f"{_ATOM_NS}link")
+            if link_elem is None:
+                link_elem = entry.find("{*}link")
+            if link_elem is not None:
+                link = link_elem.get("href", "") or ""
+        description = (
+            _elem_text(entry, "summary")
+            or _elem_text(entry, "content")
+            or _elem_text(entry, "description")
+        )
+        posted = (
+            _elem_text(entry, "published")
+            or _elem_text(entry, "updated")
+            or _elem_text(entry, "pubDate")
+        )
+        skills = _extract_skills_from_text(description or title)
+        jobs.append(ATSJob(
+            source="rss_atom",
+            url=link or "",
+            title=title,
+            company=company,
+            description=description,
+            skills=skills,
+            posted_date=posted,
+        ))
+    return jobs

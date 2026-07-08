@@ -89,19 +89,85 @@ class RawResponse:
 
 
 # ---------------------------------------------------------------------------
-# Sidecar: jrf stealth_fetch (preferred) or vanilla requests
-# ---------------------------------------------------------------------------
+# Sidecar: jrf stealth_fetch (preferred) or vanilla requests.
+# Search a few common locations for the job-research-framework project. The
+# default is ``~/.hermes/projects/job-research-framework`` (a symlink), but
+# the symlink target may not be mounted (e.g. USB drive not plugged in). We
+# also probe /media and /mnt so a freshly plugged drive "just works".
+# When none of the candidates exist, we fall back to vanilla ``requests``
+# and emit a warning so the user knows stealth protection is unavailable.
+def _find_jrf_path() -> Path | None:
+    candidates: list[Path] = []
+
+    # The "standard" symlink path (preferred)
+    candidates.append(Path.home() / ".hermes/projects/job-research-framework")
+
+    # /media/hermes-pi/<uuid>/hermes/projects/job-research-framework
+    media_root = Path("/media/hermes-pi")
+    if media_root.is_dir():
+        for child in media_root.iterdir():
+            candidate = child / "hermes/projects/job-research-framework"
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    # /mnt/.../hermes/projects/job-research-framework (less common).
+    # We only probe the first level under /mnt — deeper rglob would be
+    # unbounded and could hang on systems with many mount points.
+    mnt_root = Path("/mnt")
+    if mnt_root.is_dir():
+        try:
+            for child in mnt_root.iterdir():
+                candidate = child / "hermes/projects/job-research-framework"
+                if candidate not in candidates:
+                    candidates.append(candidate)
+        except (PermissionError, OSError):
+            pass
+
+    for c in candidates:
+        if c.is_dir() and (c / "scripts" / "stealth_fetch.py").is_file():
+            return c
+    return None
+
 
 try:
-    _JRF_PATH = Path.home() / ".hermes/projects/job-research-framework"
-    if _JRF_PATH.exists() and str(_JRF_PATH) not in sys.path:
+    _JRF_PATH = _find_jrf_path()
+    if _JRF_PATH is not None and str(_JRF_PATH) not in sys.path:
         sys.path.insert(0, str(_JRF_PATH))
     from scripts.stealth_fetch import stealth_fetch as _jrf_stealth_fetch  # type: ignore
     _HAS_JRF = True
-except Exception as _e:   # ImportError, but also if jrf is broken
+    logger.info("jrf stealth_fetch loaded from %s", _JRF_PATH)
+except ImportError as _e:
     _jrf_stealth_fetch = None
     _HAS_JRF = False
-    logger.debug("jrf stealth_fetch not available: %s", _e)
+    logger.warning(
+        "jrf stealth_fetch not available (ImportError: %s). Falling back to vanilla "
+        "requests — curl_cffi TLS impersonation disabled. Run the "
+        "job-research-framework project locally, or set up a residential proxy, "
+        "before scraping CF-protected sites.", _e,
+    )
+except OSError as _e:
+    _jrf_stealth_fetch = None
+    _HAS_JRF = False
+    logger.warning(
+        "jrf stealth_fetch not available (OSError: %s). Falling back to vanilla "
+        "requests — curl_cffi TLS impersonation disabled. Run the "
+        "job-research-framework project locally, or set up a residential proxy, "
+        "before scraping CF-protected sites.", _e,
+    )
+except Exception as _e:
+    # Programming error in stealth_fetch.py — log as ERROR
+    logger.error(
+        "jrf stealth_fetch failed to load due to unexpected error (%s: %s). "
+        "This indicates a bug in the stealth_fetch module itself. ",
+        type(_e).__name__, _e,
+    )
+    _jrf_stealth_fetch = None
+    _HAS_JRF = False
+
+
+# ---------------------------------------------------------------------------
+# Fetcher (Pillar 0: HTTP, fallback; stealth via JRF if available)
+# ---------------------------------------------------------------------------
 
 
 def _http_get(url: str, timeout: int = 30, impersonate: Optional[str] = "chrome120") -> tuple:
