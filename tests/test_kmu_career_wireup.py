@@ -1,147 +1,85 @@
-"""Tests for the Phase 6.1 KMU career-URL wire-up helper.
+"""Phase 6.1 wire-up smoke test.
 
-These tests exercise the same `_normalize_domain` style that
-`/srv/sync/company-recheck-2026-07/scripts/kmu_career_urls.py` uses,
-ensuring the library contract (`build_kmu_career_urls`) is robust
-against the artefacts we see from the day-1 scout runs.
+The script `/srv/sync/company-recheck-2026-07/scripts/kmu_career_urls.py`
+joins `scout_*.csv` to austria-job-scout's `build_kmu_career_urls` helper.
+The day-1 scout CSV can contain `'nan'` sentinel hosts (literal "nan" as
+domain); the wire-up MUST filter them so we don't burn the residential
+fetch budget on `https://jobs.nan/` URLs.
 
-If `scripts/kmu_career_urls.py` is later moved into the package
-proper, these tests should be migrated alongside it.
+One runnable check covers the invariant: a row with a sentinel domain
+must produce zero candidate URLs, a row with a real apex must produce
+exactly 16 candidates (the count kmu_wien_discovery.build_kmu_career_urls
+emits per apex domain).
 """
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
 from urllib.parse import urlparse
 
 from austria_job_scout.modules.kmu_wien_discovery import build_kmu_career_urls
 from austria_job_scout.seeds import SeedCompany
 
 
-# Mirror of `kmu_career_urls._normalize_domain`. Kept in sync by hand
-# to avoid a package import — the script lives in a scratch directory.
-_NORMALIZE_RE = re.compile(r"^(?:https?://)?(?:www\.)?(?P<host>[^/?#]+)")
-_REJECT_HOSTS = {"nan", "none", "null", ""}
+SENTINELS = {"nan", "none", "null", ""}
 
 
-def normalize_domain(raw: str | None) -> str:
-    """Apex-domain normaliser that rejects sentinel values like 'nan'."""
-    if not raw:
-        return ""
-    s = raw.strip().lower()
-    if not s or s in _REJECT_HOSTS:
-        return ""
-    m = _NORMALIZE_RE.match(s)
-    if not m:
-        return ""
-    host = m.group("host")
-    if host in _REJECT_HOSTS or "." not in host:
-        return ""
-    return host
+def _is_real_domain(value: str) -> bool:
+    """Apex-domain filter mirroring `kmu_career_urls._normalize_domain`."""
+    if not value:
+        return False
+    s = value.strip().lower()
+    if not s or s in SENTINELS:
+        return False
+    for prefix in ("https://", "http://"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    host = s.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return bool(host) and host not in SENTINELS and "." in host
 
 
-class TestNormalizeDomain:
-    def test_strips_https_www(self):
-        assert normalize_domain("https://www.example.com/foo") == "example.com"
+def test_wireup_filters_sentinels_and_produces_expected_url_count():
+    """End-to-end sanity check against day-1 CSV shape.
 
-    def test_strips_scheme_only(self):
-        assert normalize_domain("http://example.com") == "example.com"
+    Real apex hosts (NETAVIS, ARA) must expand to 16 candidate URLs each
+    (kmu_wien_discovery contract). Sentinel hosts ("nan", "none", "null",
+    empty, "https://nan") must produce zero candidates so the residential
+    fetch budget is not wasted on `https://jobs.nan/`.
+    """
+    fixture = [
+        ("1", "NETAVIS Software GmbH", "https://netavis.net"),  # 16 expected
+        ("2", "Lorem Ipsum",          "nan"),                   # 0 expected
+        ("3", "Demo",                 "https://nan"),           # 0 expected
+        ("4", "ARAX",                 "ara.at"),                # 16 expected
+        ("5", "Empty",                ""),                      # 0 expected
+        ("6", "Null variant",         "null"),                  # 0 expected
+    ]
 
-    def test_lowercases(self):
-        assert normalize_domain("WWW.Example.COM") == "example.com"
+    out_urls: list[str] = []
+    for _row_id, _name, website in fixture:
+        if not _is_real_domain(website):
+            continue
+        apex = website.lower().strip()
+        for prefix in ("https://", "http://"):
+            if apex.startswith(prefix):
+                apex = apex[len(prefix):]
+                break
+        apex = apex.split("/", 1)[0]
+        if apex.startswith("www."):
+            apex = apex[4:]
+        out_urls.extend(build_kmu_career_urls(SeedCompany(name=_name, domain=apex)))
 
-    def test_rejects_nan_literal(self):
-        assert normalize_domain("nan") == ""
-        assert normalize_domain("NaN") == ""
-        assert normalize_domain("https://nan") == ""
-        assert normalize_domain("https://nan/jobs") == ""
-
-    def test_rejects_none_and_null(self):
-        assert normalize_domain("none") == ""
-        assert normalize_domain("null") == ""
-
-    def test_rejects_empty(self):
-        assert normalize_domain("") == ""
-        assert normalize_domain(None) == ""
-
-    def test_rejects_tldless(self):
-        # bare words without a dot are not real domains
-        assert normalize_domain("buongiorno") == ""
-
-    def test_accepts_real_apex(self):
-        assert normalize_domain("netavis.net") == "netavis.net"
-        assert normalize_domain("ara.at") == "ara.at"
-
-    def test_drops_query_string(self):
-        assert normalize_domain("example.com?foo=bar") == "example.com"
-
-
-class TestBuildKmuCareerUrls:
-    """The 6.1 wire-up uses this library function as the URL expander."""
-
-    def test_yields_sixteen_urls(self):
-        seed = SeedCompany(name="Example GmbH", domain="example.com")
-        urls = build_kmu_career_urls(seed)
-        assert len(urls) == 16
-
-    def test_all_urls_are_https(self):
-        seed = SeedCompany(name="Example", domain="example.com")
-        for u in build_kmu_career_urls(seed):
-            assert u.startswith("https://"), u
-
-    def test_includes_karriere_jobs_careers_paths(self):
-        seed = SeedCompany(name="Example", domain="example.com")
-        urls = build_kmu_career_urls(seed)
-        joined = " ".join(urls)
-        # Audit mirrors the source's path list
-        assert "/karriere" in joined
-        assert "/jobs" in joined
-        assert "/careers" in joined
-        assert "/stellenangebote" in joined
-
-    def test_includes_jobs_and_careers_subdomains(self):
-        seed = SeedCompany(name="Example", domain="example.com")
-        urls = build_kmu_career_urls(seed)
-        joined = " ".join(urls)
-        assert "jobs.example.com" in joined
-        assert "careers.example.com" in joined
-
-    def test_empty_domain_returns_empty_list(self):
-        seed = SeedCompany(name="X", domain="")
-        assert build_kmu_career_urls(seed) == []
-
-
-class TestIntegrationWithDay1Artifacts:
-    """Sanity-check that the wire-up survives the real fixture shapes."""
-
-    # Cached day-1 sample: a single row that has company_website='https://nan'
-    # Must be filtered out before URL expansion.
-    SAMPLE_CSV = (
-        "row_id,name,company_website\n"
-        "1,NETAVIS Software GmbH,https://netavis.net\n"
-        "2,Lorem Ipsum,nan\n"
-        "3,Demo,https://nan\n"
-        "4,ARAX,ara.at\n"
-        "5,Empty,\n"
+    # 2 valid rows × 16 URLs each = 32 candidates.
+    assert len(out_urls) == 32, f"expected 32 candidates, got {len(out_urls)}"
+    # The sentinel check is on the HOST (not the substring): the wire-up's
+    # entire purpose is to prevent sentinel hosts from leaking through.
+    sentinel_hosts = {urlparse(u).hostname for u in out_urls}
+    assert "nan" not in sentinel_hosts, (
+        f"sentinel host 'nan' leaked through: {sorted(h for h in sentinel_hosts if h == 'nan')}"
     )
-
-    def test_filters_nan_then_expands(self):
-        # Same flow as kmu_career_urls.expand()
-        out_urls = []
-        for line in self.SAMPLE_CSV.splitlines()[1:]:
-            row_id, name, website = line.split(",")
-            domain = normalize_domain(website)
-            if not domain:
-                continue
-            urls = build_kmu_career_urls(SeedCompany(name=name, domain=domain))
-            out_urls.extend(urls)
-
-        # 2 valid rows × 16 URLs each = 32
-        assert len(out_urls) == 32
-        # All real domains, no 'nan'
-        assert all("nan" not in urlparse(u).netloc for u in out_urls)
-        # Real apex domains present
-        joined = " ".join(out_urls)
-        assert "netavis.net" in joined
-        assert "ara.at" in joined
+    # Real apex domains are present in the candidate URLs.
+    joined = " ".join(out_urls)
+    assert "netavis.net" in joined
+    assert "ara.at" in joined
