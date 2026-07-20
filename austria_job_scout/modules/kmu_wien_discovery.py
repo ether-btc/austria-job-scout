@@ -14,17 +14,219 @@ source HTML and passes it in.
 """
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterable
 
 from bs4 import BeautifulSoup
 
+from .. import config
 from ..seeds import SeedCompany
 
 logger = logging.getLogger(__name__)
+
+
+# Scout-row priority (lower priority value = fetched first). Mirrors the
+# wire-up script in /srv/sync/company-recheck-2026-07/scripts/. Kept here so
+# the package owns the contract — the scratch script can be retired once this
+# is the canonical entry point.
+_SCOUT_SHEET_PRIORITY: dict[str, int] = {
+    "scout_review_required.csv": 1,   # the wishlist (highest value)
+    "scout_registry_open.csv": 2,
+    "scout_strict_verified.csv": 3,   # already covered by Tier-1 ATS probes
+}
+
+
+_SENTINEL_DOMAINS: frozenset[str] = frozenset({
+    "nan", "none", "null", "n/a", "na", "",
+})
+
+
+def _normalize_apex_domain(raw: str | None) -> str:
+    """Strip scheme + ``www.`` prefix → apex (matches ``build_kmu_career_urls``).
+
+    Returns ``""`` for empty / sentinel hosts so the caller can skip them.
+    A sentinel domain would otherwise produce garbage candidate URLs like
+    ``https://jobs.nan/`` and burn the residential fetch budget.
+    """
+    if not raw:
+        return ""
+    s = raw.strip().lower()
+    if not s or s in _SENTINEL_DOMAINS:
+        return ""
+    for prefix in ("https://", "http://"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    host = s.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    if not host or host in _SENTINEL_DOMAINS or "." not in host:
+        return ""
+    return host
+
+
+def _candidate_row(
+    *,
+    source_sheet: str,
+    source_row_id: str,
+    company_name: str,
+    company_domain: str,
+    url: str,
+    candidate_kind: str,
+    candidate_path: str,
+    notes: str,
+    predicted_relevance: float = 0.30,
+) -> dict[str, Any]:
+    """Build one Target dict matching :func:`target_discovery.discover`'s shape.
+
+    Priority is read from ``config.SOURCE_PRIORITY['career_path']`` (or 30 if
+    unset) so career-path KMU probes rank below Tier-1 ATS endpoints but
+    above aggregator queries — they're known targets, just not pre-classified.
+    """
+    return {
+        "ats": "generic_html",  # best-effort; ATS classifier runs on the response
+        "source_kind": "kmu_career_url",
+        "url": url,
+        "company_name": company_name,
+        "company_domain": company_domain,
+        "predicted_relevance": max(0.0, min(1.0, predicted_relevance)),
+        "priority": config.SOURCE_PRIORITY.get("career_path", 30),
+        "notes": (
+            f"kmu_wishlist:{company_name}; "
+            f"sheet={source_sheet}; row={source_row_id}; "
+            f"kind={candidate_kind}; path={candidate_path}; {notes}".strip()
+        ),
+    }
+
+
+def scout_csv_targets(
+    scout_csv: Path | str,
+    *,
+    max_rows: int | None = None,
+    sheets: Iterable[str] | None = None,
+    primary_relevance: float = 0.45,
+    alternate_relevance: float = 0.30,
+) -> list[dict[str, Any]]:
+    """Expand a company-quickcheck scout CSV into a list of KMU Target dicts.
+
+    Parameters
+    ----------
+    scout_csv
+        Path to a single ``scout_*.csv`` (one of the three scout exports from
+        the day-1 recheck pipeline) OR a parent directory containing them.
+        If a directory is passed, all known scout sheets are processed in
+        priority order (``scout_review_required`` first).
+    max_rows
+        Cap on scout rows successfully expanded (each row produces ~16 URLs
+        via :func:`build_kmu_career_urls`). Truncation respects sheet
+        priority — the wishlist is consumed first.
+    sheets
+        Explicit sheet-name whitelist. Defaults to all three known sheets.
+    primary_relevance, alternate_relevance
+        Predicted-relevance scores for the first / subsequent candidate URL
+        per domain. Defaults reflect "no ATS known → moderate confidence".
+
+    Returns
+    -------
+    list of Target dicts, ordered by (source_sheet priority, predicted_relevance
+    DESC). Output is JSON-serialisable and directly consumable by
+    :func:`austria_job_scout.modules.fetcher.fetch`.
+
+    Notes
+    -----
+    Pure, no network. Sentinel domains (``nan``, ``none``, ``null``, ``""``,
+    TLDless) are filtered out before URL expansion so the residential fetch
+    budget is never spent on ``https://jobs.nan/``.
+    """
+    scout_csv = Path(scout_csv)
+    if scout_csv.is_dir():
+        chosen = list(sheets) if sheets else list(_SCOUT_SHEET_PRIORITY.keys())
+        sources = [scout_csv / s for s in chosen]
+    else:
+        sources = [scout_csv]
+
+    out: list[dict[str, Any]] = []
+    rows_expanded = 0
+    truncated = False
+
+    # Process in priority order so max_rows truncation favours the wishlist.
+    for src in sorted(sources, key=lambda p: _SCOUT_SHEET_PRIORITY.get(p.name, 99)):
+        if not src.exists():
+            logger.debug("scout sheet missing, skipping: %s", src)
+            continue
+        sheet_name = src.name
+        try:
+            f = src.open(newline="")
+        except OSError as e:
+            logger.warning("could not open scout sheet %s: %s", src, e)
+            continue
+        with f:
+            rd = csv.DictReader(f)
+            for row in rd:
+                if max_rows is not None and rows_expanded >= max_rows:
+                    truncated = True
+                    break
+                website = (
+                    row.get("company_website")
+                    or row.get("website")
+                    or ""
+                )
+                apex = _normalize_apex_domain(website)
+                if not apex:
+                    continue
+                name = (
+                    row.get("name")
+                    or row.get("company_name")
+                    or ""
+                ).strip()
+                if not name:
+                    continue
+                row_id = str(row.get("row_id", "")).strip()
+
+                urls = build_kmu_career_urls(SeedCompany(name=name, domain=apex))
+                if not urls:
+                    continue
+
+                for i, url in enumerate(urls):
+                    is_primary = i == 0
+                    path = url.split(apex, 1)[-1] if apex in url else url
+                    out.append(_candidate_row(
+                        source_sheet=sheet_name,
+                        source_row_id=row_id,
+                        company_name=name,
+                        company_domain=apex,
+                        url=url,
+                        candidate_kind="primary" if is_primary else "alternate",
+                        candidate_path=path[:60],
+                        notes=f"row_id={row_id}" if row_id else "",
+                        predicted_relevance=primary_relevance if is_primary else alternate_relevance,
+                    ))
+                rows_expanded += 1
+
+    # Dedupe by URL (keep highest priority, then highest relevance).
+    by_url: dict[str, dict[str, Any]] = {}
+    for t in out:
+        cur = by_url.get(t["url"])
+        if cur is None or (t["priority"], -t["predicted_relevance"]) < (
+            cur["priority"], -cur["predicted_relevance"]
+        ):
+            by_url[t["url"]] = t
+    deduped = list(by_url.values())
+
+    # Stable sort: priority ASC, then predicted_relevance DESC.
+    deduped.sort(key=lambda t: (t["priority"], -t["predicted_relevance"]))
+
+    logger.info(
+        "scout_csv_targets: expanded %d rows → %d candidate URLs (%d after dedupe) "
+        "from %d sheet(s); truncated=%s",
+        rows_expanded, len(out), len(deduped), len(sources), truncated,
+    )
+    return deduped
 
 
 @dataclass

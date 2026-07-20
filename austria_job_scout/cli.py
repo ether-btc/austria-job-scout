@@ -185,6 +185,73 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_discover_kmu(args: argparse.Namespace) -> int:
+    """Phase 6.1 — expand a company-quickcheck scout CSV into Target dicts.
+
+    Pure (no network). Output JSON has the same ``{"targets": [...]}`` shape
+    as :func:`cmd_discover`, so it can be piped directly into ``fetch``::
+
+        python -m austria_job_scout discover-kmu \\
+            --scout-csv /srv/sync/company-recheck-2026-07/scout/ \\
+            --max-rows 50 \\
+            --out targets.json
+
+        python -m austria_job_scout fetch --targets targets.json \\
+            --max-fetches 25
+    """
+    from .modules import kmu_wien_discovery as kmu
+
+    scout_path = Path(args.scout_csv)
+    if not scout_path.exists():
+        print(f"error: --scout-csv path does not exist: {scout_path}", file=sys.stderr)
+        return 1
+
+    targets = kmu.scout_csv_targets(
+        scout_path,
+        max_rows=args.max_rows,
+        primary_relevance=args.primary_relevance,
+        alternate_relevance=args.alternate_relevance,
+    )
+
+    # Optional Pillar-0b-style discrimination filter — matches the
+    # `discover` subcommand's behaviour so the output is interchangeable.
+    if args.min_relevance > 0:
+        before = len(targets)
+        targets = [t for t in targets if t["predicted_relevance"] >= args.min_relevance]
+        if not config.AGGRESSIVE_MODE:
+            targets = [t for t in targets if not config.is_cf_protected(t["url"])]
+        dropped = before - len(targets)
+        if dropped:
+            print(f"min-relevance filter dropped {dropped} target(s)", file=sys.stderr)
+
+    if args.max_targets:
+        targets = targets[:args.max_targets]
+
+    payload = {
+        "scout_csv": str(scout_path),
+        "scout_csv_kind": "directory" if scout_path.is_dir() else "file",
+        "target_count": len(targets),
+        "config": {
+            "aggressive_mode": config.AGGRESSIVE_MODE,
+            "max_targets_per_run": config.MAX_TARGETS_PER_RUN,
+            "min_relevance": args.min_relevance,
+            "max_targets": args.max_targets,
+        },
+        "targets": targets,
+    }
+
+    if args.out:
+        Path(args.out).write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+        print(
+            f"wrote {len(targets)} KMU targets to {args.out} "
+            f"(scout_csv={scout_path}, max_rows={args.max_rows})",
+            file=sys.stderr,
+        )
+    else:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_fetch(args: argparse.Namespace) -> int:
     """Fetch a list of targets. NETWORK. Honours Pillar 0 + Pillar 0b."""
     if args.targets == "-":
@@ -487,6 +554,30 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--min-relevance", type=float, default=0.15,
                     help="drop targets below this predicted relevance (0.0-1.0)")
     sp.set_defaults(func=cmd_discover)
+
+    # --- Phase 6.1: discover-kmu — pure CSV → Target dicts (no network) ---
+    sp = sub.add_parser(
+        "discover-kmu", parents=[sub_parent],
+        help="Phase 6.1: expand company-quickcheck scout CSV into Target dicts "
+             "(pure; no network; pipe output into `fetch`)",
+    )
+    sp.add_argument("--scout-csv", required=True,
+                    help="path to a scout_*.csv file OR the parent directory "
+                         "containing scout_*.csv (e.g. /srv/sync/company-recheck-2026-07/scout/)")
+    sp.add_argument("--max-rows", type=int, default=None,
+                    help="cap on expanded scout rows (each row → ~16 candidate URLs). "
+                         "Truncation respects sheet priority (scout_review_required first)")
+    sp.add_argument("--max-targets", type=int, default=None,
+                    help="hard cap on returned target count (post-filter)")
+    sp.add_argument("--min-relevance", type=float, default=0.0,
+                    help="drop targets below this predicted relevance (0.0-1.0)")
+    sp.add_argument("--primary-relevance", type=float, default=0.45,
+                    help="predicted_relevance for the first candidate URL per domain "
+                         "(default: 0.45 — moderate confidence for unknown ATS)")
+    sp.add_argument("--alternate-relevance", type=float, default=0.30,
+                    help="predicted_relevance for subsequent candidate URLs per domain")
+    sp.add_argument("--out", help="write targets JSON to this file instead of stdout")
+    sp.set_defaults(func=cmd_discover_kmu)
 
     sp = sub.add_parser("fetch", parents=[sub_parent], help="[iter-2] fetch a list of targets (NETWORK — honours Pillar 0 + 0b)")
     sp.add_argument("--targets", required=True,

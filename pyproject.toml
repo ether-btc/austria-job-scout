@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "austria-job-scout"
-version = "0.1.0"
+version = "0.3.0"
 description = "Find similar Austrian job postings given a reference job — modular, residential-IP-safe."
 readme = "README.md"
 requires-python = ">=3.11"
