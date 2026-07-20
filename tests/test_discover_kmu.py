@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import csv
 import json
+import socket
 import sys
 from pathlib import Path
 
 import pytest
 
 from austria_job_scout import cli
+from austria_job_scout.modules import kmu_wien_discovery as kmu
 from austria_job_scout.modules.kmu_wien_discovery import (
     build_kmu_career_urls,
     scout_csv_targets,
@@ -447,3 +449,270 @@ def test_cli_discover_kmu_output_is_pure_json(capsys, tmp_path):
     captured = capsys.readouterr()
     payload = json.loads(captured.out)  # must parse
     assert payload["target_count"] == 16
+
+
+# ---------------------------------------------------------------------------
+# DNS pre-flight tests
+# ---------------------------------------------------------------------------
+
+
+def _fake_resolver(results: dict[str, Exception | list]):
+    """Build a fake :func:`socket.getaddrinfo` that returns canned results.
+
+    Keys are apex hostnames; values are either an exception instance to
+    raise, or a list of address tuples (any truthy list is treated as ok).
+    """
+
+    def _fake(host, port, family, type_, proto, flags):
+        if host not in results:
+            raise socket.gaierror(-2, "Name or service not known")  # NXDOMAIN
+        v = results[host]
+        if isinstance(v, Exception):
+            raise v
+        return v if v else []
+
+    return _fake
+
+
+def test_dns_resolves_returns_ok_for_resolving_apex():
+    fake = _fake_resolver({
+        "good.at": [("family", "type", "proto", "canonname", ("1.2.3.4", 0))],
+    })
+    ok, reason = kmu.dns_resolves("good.at", resolver=fake)
+    assert ok is True
+    assert reason == ""
+
+
+def test_dns_resolves_returns_nxdomain():
+    fake = _fake_resolver({})
+    ok, reason = kmu.dns_resolves("does-not-exist.at", resolver=fake)
+    assert ok is False
+    assert reason == "dns_nxdomain"
+
+
+def test_dns_resolves_returns_timeout():
+    fake = _fake_resolver({
+        "slow.at": socket.timeout("timed out"),
+    })
+    ok, reason = kmu.dns_resolves("slow.at", resolver=fake)
+    assert ok is False
+    assert reason == "dns_timeout"
+
+
+def test_dns_resolves_returns_oserror():
+    fake = _fake_resolver({
+        "broken.at": OSError("connection refused"),
+    })
+    ok, reason = kmu.dns_resolves("broken.at", resolver=fake)
+    assert ok is False
+    assert reason.startswith("dns_error:")
+
+
+def test_dns_resolves_rejects_empty_apex():
+    ok, reason = kmu.dns_resolves("")
+    assert ok is False
+    assert reason == "sentinel"
+
+
+def test_scout_csv_targets_dns_preflight_off_by_default(tmp_path):
+    """Without dns_preflight_enabled, no DNS lookups happen (fast path)."""
+    csv_path = tmp_path / "scout_review_required.csv"
+    _write_scout(csv_path, [
+        {"row_id": "1", "name": "Real", "company_website": "https://real.at"},
+        {"row_id": "2", "name": "Fake", "company_website": "https://does-not-exist.at"},
+    ])
+    # If DNS were called, "Fake" would be dropped. With preflight off, both
+    # rows are expanded to candidate URLs.
+    targets = scout_csv_targets(csv_path, dns_preflight_enabled=False)
+    domains = {t["company_domain"] for t in targets}
+    assert "real.at" in domains
+    assert "does-not-exist.at" in domains  # still present, no DNS check
+
+
+def test_scout_csv_targets_dns_preflight_drops_unresolving(tmp_path):
+    """With dns_preflight_enabled, unresolvable apexes are filtered."""
+    csv_path = tmp_path / "scout_review_required.csv"
+    _write_scout(csv_path, [
+        {"row_id": "1", "name": "Real",  "company_website": "https://real.at"},
+        {"row_id": "2", "name": "Ghost", "company_website": "https://ghost.at"},
+    ])
+    fake = _fake_resolver({
+        "real.at": [("f", "t", "p", "cn", ("1.2.3.4", 0))],
+        # ghost.at not in dict → fake resolver raises gaierror (NXDOMAIN)
+    })
+
+    dropped: list[kmu.DroppedRow] = []
+    targets = scout_csv_targets(
+        csv_path,
+        dns_preflight_enabled=True,
+        resolver=fake,
+        on_dropped=dropped.append,
+    )
+
+    domains = {t["company_domain"] for t in targets}
+    assert domains == {"real.at"}, f"only real.at should survive, got {domains}"
+    # One dropped row recorded for ghost.at
+    assert len(dropped) == 1
+    assert dropped[0].dropped_apex == "ghost.at"
+    assert dropped[0].reason == "dns_nxdomain"
+    assert dropped[0].company_name == "Ghost"
+    assert dropped[0].source_sheet == "scout_review_required.csv"
+
+
+def test_scout_csv_targets_dns_preflight_caches_per_apex(tmp_path):
+    """Each unique apex is DNS-checked at most once even if it appears
+    across multiple rows."""
+    csv_path = tmp_path / "scout_review_required.csv"
+    _write_scout(csv_path, [
+        {"row_id": "1", "name": "A", "company_website": "https://x.at"},
+        {"row_id": "2", "name": "B", "company_website": "https://x.at/path"},
+        {"row_id": "3", "name": "C", "company_website": "www.x.at"},
+    ])
+
+    call_count = {"n": 0}
+
+    def counting_resolver(host, *args, **kwargs):
+        call_count["n"] += 1
+        return [("f", "t", "p", "cn", ("1.2.3.4", 0))]
+
+    targets = scout_csv_targets(
+        csv_path,
+        dns_preflight_enabled=True,
+        resolver=counting_resolver,
+    )
+    # All 3 rows normalise to x.at — only one DNS lookup expected.
+    assert call_count["n"] == 1, f"expected 1 DNS lookup, got {call_count['n']}"
+    # All 3 rows collapse to the same 16 candidate URLs (deduped by URL),
+    # which is the same invariant we exercise in other tests.
+    assert len(targets) == 16
+
+
+def test_scout_csv_targets_emits_dropped_for_sentinel(tmp_path):
+    """Sentinel rejections also fire on_dropped so the upstream pipeline
+    sees them too (they're data-quality signals)."""
+    csv_path = tmp_path / "scout_review_required.csv"
+    _write_scout(csv_path, [
+        {"row_id": "1", "name": "Nan Co", "company_website": "nan"},
+        {"row_id": "2", "name": "None Co", "company_website": "none"},
+        {"row_id": "3", "name": "Real Co", "company_website": "https://real.at"},
+    ])
+    fake = _fake_resolver({
+        "real.at": [("f", "t", "p", "cn", ("1.2.3.4", 0))],
+    })
+    dropped: list[kmu.DroppedRow] = []
+    targets = scout_csv_targets(
+        csv_path,
+        dns_preflight_enabled=True,
+        resolver=fake,
+        on_dropped=dropped.append,
+    )
+    # 2 sentinels + 0 DNS drops = 2 dropped rows; only real.at survives.
+    assert len(dropped) == 2
+    assert all(d.reason == "sentinel" for d in dropped)
+    assert {d.company_name for d in dropped} == {"Nan Co", "None Co"}
+    domains = {t["company_domain"] for t in targets}
+    assert domains == {"real.at"}
+
+
+def test_scout_csv_targets_emits_dropped_for_missing_name(tmp_path):
+    """Rows with a valid apex but no name are dropped with reason='missing_name'."""
+    csv_path = tmp_path / "scout_review_required.csv"
+    with csv_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=("row_id", "company_website"))
+        w.writeheader()
+        w.writerow({"row_id": "1", "company_website": "https://real.at"})
+        w.writerow({"row_id": "2", "company_website": "https://also.at"})
+
+    fake = _fake_resolver({
+        "real.at": [("f", "t", "p", "cn", ("1.2.3.4", 0))],
+        "also.at": [("f", "t", "p", "cn", ("1.2.3.4", 0))],
+    })
+    dropped: list[kmu.DroppedRow] = []
+    targets = scout_csv_targets(
+        csv_path,
+        dns_preflight_enabled=True,
+        resolver=fake,
+        on_dropped=dropped.append,
+    )
+    assert targets == []
+    assert len(dropped) == 2
+    assert all(d.reason == "missing_name" for d in dropped)
+    assert {d.dropped_apex for d in dropped} == {"real.at", "also.at"}
+
+
+# ---------------------------------------------------------------------------
+# CLI: --dns-pre-flight + --out-dropped integration
+# ---------------------------------------------------------------------------
+
+
+def test_cli_discover_kmu_dns_preflight_emits_dropped_csv(tmp_path, capsys, monkeypatch):
+    """End-to-end: --dns-pre-flight + --out-dropped produces a CSV.
+
+    Patches :mod:`socket.getaddrinfo` so the test isn't dependent on the
+    real DNS resolution of the test hostnames (which would flake on CI
+    or when offline).
+    """
+    import socket as _socket
+    csv_path = tmp_path / "scout_review_required.csv"
+    _write_scout(csv_path, [
+        {"row_id": "1", "name": "Real",  "company_website": "https://real.at"},
+        {"row_id": "2", "name": "Ghost", "company_website": "https://ghost.at"},
+    ])
+    out_path = tmp_path / "targets.json"
+    dropped_path = tmp_path / "dropped.csv"
+
+    def fake_resolver(host, *args, **kwargs):
+        if host == "real.at":
+            return [("f", "t", "p", "cn", ("1.2.3.4", 0))]
+        raise _socket.gaierror(-2, "Name or service not known")
+
+    monkeypatch.setattr(kmu.socket, "getaddrinfo", fake_resolver)
+
+    rc = _run_cli([
+        "discover-kmu",
+        "--scout-csv", str(csv_path),
+        "--dns-pre-flight",
+        "--out", str(out_path),
+        "--out-dropped", str(dropped_path),
+    ])
+    assert rc == 0
+
+    payload = json.loads(out_path.read_text())
+    assert payload["config"]["dns_preflight"] is True
+    assert payload["dropped_count"] == 1, f"expected 1 drop, got {payload['dropped_count']}"
+    assert payload["target_count"] == 16
+
+    # The dropped CSV must exist and be parseable.
+    assert dropped_path.exists()
+    import csv as _csv
+    with dropped_path.open() as f:
+        rd = _csv.DictReader(f)
+        rows = list(rd)
+    assert len(rows) == 1
+    assert rows[0]["company_name"] == "Ghost"
+    assert rows[0]["reason"] == "dns_nxdomain"
+    assert rows[0]["dropped_apex"] == "ghost.at"
+
+
+def test_cli_discover_kmu_without_dropped_csv_unchanged(tmp_path, capsys):
+    """Default behaviour (no --out-dropped) must not write a dropped CSV
+    and must not change the stdout payload shape beyond adding the
+    dropped_count + dns_preflight config keys."""
+    csv_path = tmp_path / "scout_review_required.csv"
+    _write_scout(csv_path, [
+        {"row_id": "1", "name": "Real", "company_website": "https://real.at"},
+    ])
+    out_path = tmp_path / "targets.json"
+
+    rc = _run_cli([
+        "discover-kmu",
+        "--scout-csv", str(csv_path),
+        "--out", str(out_path),
+    ])
+    assert rc == 0
+    payload = json.loads(out_path.read_text())
+    assert payload["dropped_count"] == 0
+    assert payload["config"]["dns_preflight"] is False
+    # No dropped CSV should have been written anywhere
+    assert not (tmp_path / "dropped.csv").exists()
+
