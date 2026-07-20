@@ -52,3 +52,5 @@ reports/
 .pytest_cache/
 .coverage
 htmlcov/
+# Local runtime outputs (live_pilot results, transient DBs, dropped.csv evidence)
+live_results/
