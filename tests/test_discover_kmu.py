@@ -87,6 +87,93 @@ def test_scout_csv_targets_filters_sentinel_domains(tmp_path: Path):
     assert "realco.at" in hosts
 
 
+def test_scout_csv_targets_filters_malformed_csv_urls(tmp_path: Path):
+    """Defence in depth: CSV typos with commas/semicolons in the website
+    field must not produce malformed candidate URLs (Pillar 0 — never
+    burn residential budget on a guaranteed-fail request).
+
+    Regression: real-world scout CSV had ``https://irm.at, www.olf.com``
+    as a website value; the old normaliser took the comma as part of the
+    host, producing ``https://jobs.irm.at, www.olf.com/karriere`` which
+    would never resolve.
+
+    Note: trailing whitespace alone is benign (we strip it). Internal
+    whitespace or separator characters (`,;|`) are the real signal that
+    two URLs ended up in one cell.
+    """
+    csv_path = tmp_path / "scout_review_required.csv"
+    _write_scout(csv_path, [
+        {"row_id": "1", "name": "Good",    "company_website": "https://good.at"},
+        {"row_id": "2", "name": "CSV Typo Comma", "company_website": "https://irm.at, www.olf.com"},
+        {"row_id": "3", "name": "CSV Typo Semi",  "company_website": "irm.at;"},
+        {"row_id": "4", "name": "CSV Typo Pipe",  "company_website": "foo|bar.at"},
+    ])
+
+    targets = scout_csv_targets(csv_path)
+
+    # Only "Good" survives — the others all have separator characters.
+    assert len(targets) == 16, f"expected 16 (good only), got {len(targets)}"
+    from urllib.parse import urlparse
+    for t in targets:
+        host = urlparse(t["url"]).hostname or ""
+        for bad in (" ", "\t", ",", ";", "|"):
+            assert bad not in host, (
+                f"malformed host leaked: {host!r} from {t['url']}"
+            )
+        # All surviving targets belong to the "Good" company
+        assert t["company_name"] == "Good"
+
+
+def test_scout_csv_targets_handles_leading_dot_edge_case(tmp_path: Path):
+    """A stray leading dot in the host (CSV edge case ``.foo.at``) is
+    normalised to ``foo.at``. Multiple leading dots are stripped too.
+    But a host that is *only* dots, or one with a trailing dot, must be
+    rejected entirely.
+    """
+    csv_path = tmp_path / "scout_review_required.csv"
+    _write_scout(csv_path, [
+        {"row_id": "1", "name": "Leading Dot",   "company_website": "https://.good.at"},
+        {"row_id": "2", "name": "Double Dots",   "company_website": "..good.at"},
+        {"row_id": "3", "name": "Trailing Dot",  "company_website": "bad.at."},
+    ])
+
+    targets = scout_csv_targets(csv_path)
+
+    # Only "Leading Dot" and "Double Dots" survive (both normalise to
+    # good.at, so 16 candidates after dedupe). "Trailing Dot" is rejected.
+    assert len(targets) == 16, f"expected 16, got {len(targets)}"
+    from urllib.parse import urlparse
+    for t in targets:
+        host = urlparse(t["url"]).hostname or ""
+        # No leading or trailing dots on the bare host
+        bare = host.split(".", 1)[-1] if "." in host else host
+        assert not host.startswith(".")
+        assert not host.endswith(".")
+    # The "Trailing Dot" company should not appear
+    names = {t["company_name"] for t in targets}
+    assert "Trailing Dot" not in names
+
+
+def test_scout_csv_targets_tolerates_trailing_whitespace(tmp_path: Path):
+    """Trailing whitespace in the website cell is harmless — we strip it.
+    Internal whitespace or separators, on the other hand, indicate a
+    multi-URL cell that must be rejected.
+    """
+    csv_path = tmp_path / "scout_review_required.csv"
+    _write_scout(csv_path, [
+        {"row_id": "1", "name": "Trailing Space", "company_website": "good.at   "},
+        {"row_id": "2", "name": "Trailing Newline", "company_website": "good.at\n"},
+    ])
+
+    targets = scout_csv_targets(csv_path)
+    # Both rows resolve to the same apex `good.at` → 16 candidates after dedupe.
+    assert len(targets) == 16
+    from urllib.parse import urlparse
+    for t in targets:
+        host = urlparse(t["url"]).hostname or ""
+        assert not any(c in host for c in " ,\t\n;|")
+
+
 def test_scout_csv_targets_emits_target_shape(tmp_path: Path):
     """Output dicts must have exactly the keys `discover` emits.
 

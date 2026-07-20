@@ -67,6 +67,19 @@ def _normalize_apex_domain(raw: str | None) -> str:
         host = host[4:]
     if not host or host in _SENTINEL_DOMAINS or "." not in host:
         return ""
+    # Reject hosts with whitespace or commas — these are CSV typos where
+    # two URLs ended up in one cell (e.g. "irm.at, www.olf.com"). Keeping
+    # them would produce malformed candidate URLs like
+    # ``https://jobs.irm.at, www.olf.com/karriere`` and burn residential
+    # budget on a guaranteed-fail request. Matches the format of real
+    # apex domains: at least one dot, TLD is alpha-only, no spaces/commas.
+    if any(c in host for c in " \t\n\r,;|"):
+        return ""
+    # Strip a stray leading dot (CSV edge case: ".foo.at").
+    host = host.lstrip(".")
+    # Last-char must be alpha (TLD); "." may not be the last char.
+    if not host or not host[-1].isalpha() or "." not in host:
+        return ""
     return host
 
 
