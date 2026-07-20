@@ -37,6 +37,7 @@ Usage examples (iter 2):
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -188,13 +189,27 @@ def cmd_discover(args: argparse.Namespace) -> int:
 def cmd_discover_kmu(args: argparse.Namespace) -> int:
     """Phase 6.1 — expand a company-quickcheck scout CSV into Target dicts.
 
-    Pure (no network). Output JSON has the same ``{"targets": [...]}`` shape
-    as :func:`cmd_discover`, so it can be piped directly into ``fetch``::
+    Pure (no HTTP) by default. With ``--dns-pre-flight``, performs DNS
+    lookups (no residential budget hit) so unresolvable apex domains are
+    excluded from the wishlist *before* any HTTP request. Dropped rows
+    (sentinel rejections, missing names, DNS failures) can be emitted
+    to a CSV via ``--out-dropped`` for ingestion into the
+    company-quickcheck pipeline.
 
+    Output JSON has the same ``{"targets": [...]}`` shape as :func:`cmd_discover`,
+    so it can be piped directly into ``fetch``::
+
+        # Pure mode (default — fast, but wishlist may include non-resolving apexes)
         python -m austria_job_scout discover-kmu \\
             --scout-csv /srv/sync/company-recheck-2026-07/scout/ \\
-            --max-rows 50 \\
-            --out targets.json
+            --max-rows 50 --out targets.json
+
+        # Safe mode (DNS pre-flight + dropped-rows feedback for upstream)
+        python -m austria_job_scout discover-kmu \\
+            --scout-csv /srv/sync/company-recheck-2026-07/scout/ \\
+            --dns-pre-flight \\
+            --out targets.json \\
+            --out-dropped dropped_during_preflight.csv
 
         python -m austria_job_scout fetch --targets targets.json \\
             --max-fetches 25
@@ -206,11 +221,19 @@ def cmd_discover_kmu(args: argparse.Namespace) -> int:
         print(f"error: --scout-csv path does not exist: {scout_path}", file=sys.stderr)
         return 1
 
+    # Collect dropped rows into a list (bounded by the row count of the
+    # input CSV — for the day-1 sheet that's ~500). For very large CSVs,
+    # consider streaming directly to disk instead.
+    dropped: list[kmu.DroppedRow] = []
+
     targets = kmu.scout_csv_targets(
         scout_path,
         max_rows=args.max_rows,
         primary_relevance=args.primary_relevance,
         alternate_relevance=args.alternate_relevance,
+        dns_preflight_enabled=args.dns_pre_flight,
+        dns_timeout_s=args.dns_timeout,
+        on_dropped=dropped.append,
     )
 
     # Optional Pillar-0b-style discrimination filter — matches the
@@ -220,9 +243,9 @@ def cmd_discover_kmu(args: argparse.Namespace) -> int:
         targets = [t for t in targets if t["predicted_relevance"] >= args.min_relevance]
         if not config.AGGRESSIVE_MODE:
             targets = [t for t in targets if not config.is_cf_protected(t["url"])]
-        dropped = before - len(targets)
-        if dropped:
-            print(f"min-relevance filter dropped {dropped} target(s)", file=sys.stderr)
+        dropped_filter = before - len(targets)
+        if dropped_filter:
+            print(f"min-relevance filter dropped {dropped_filter} target(s)", file=sys.stderr)
 
     if args.max_targets:
         targets = targets[:args.max_targets]
@@ -231,11 +254,14 @@ def cmd_discover_kmu(args: argparse.Namespace) -> int:
         "scout_csv": str(scout_path),
         "scout_csv_kind": "directory" if scout_path.is_dir() else "file",
         "target_count": len(targets),
+        "dropped_count": len(dropped),
         "config": {
             "aggressive_mode": config.AGGRESSIVE_MODE,
             "max_targets_per_run": config.MAX_TARGETS_PER_RUN,
             "min_relevance": args.min_relevance,
             "max_targets": args.max_targets,
+            "dns_preflight": args.dns_pre_flight,
+            "dns_timeout_s": args.dns_timeout,
         },
         "targets": targets,
     }
@@ -244,11 +270,42 @@ def cmd_discover_kmu(args: argparse.Namespace) -> int:
         Path(args.out).write_text(json.dumps(payload, indent=2, ensure_ascii=False))
         print(
             f"wrote {len(targets)} KMU targets to {args.out} "
-            f"(scout_csv={scout_path}, max_rows={args.max_rows})",
+            f"(scout_csv={scout_path}, max_rows={args.max_rows}, "
+            f"dns_preflight={args.dns_pre_flight}, dropped={len(dropped)})",
             file=sys.stderr,
         )
     else:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    # Persist the dropped-rows CSV if requested. Always emitted (even if
+    # empty) so downstream tooling can rely on the file existing.
+    if args.out_dropped:
+        dropped_path = Path(args.out_dropped)
+        dropped_path.parent.mkdir(parents=True, exist_ok=True)
+        with dropped_path.open("w", newline="") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=(
+                    "source_sheet", "source_row_id", "company_name",
+                    "company_website", "dropped_apex", "reason", "notes",
+                ),
+            )
+            w.writeheader()
+            for d in dropped:
+                w.writerow({
+                    "source_sheet": d.source_sheet,
+                    "source_row_id": d.source_row_id,
+                    "company_name": d.company_name,
+                    "company_website": d.company_website,
+                    "dropped_apex": d.dropped_apex,
+                    "reason": d.reason,
+                    "notes": d.notes,
+                })
+        print(
+            f"wrote {len(dropped)} dropped row(s) to {dropped_path}",
+            file=sys.stderr,
+        )
+
     return 0
 
 
@@ -555,11 +612,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="drop targets below this predicted relevance (0.0-1.0)")
     sp.set_defaults(func=cmd_discover)
 
-    # --- Phase 6.1: discover-kmu — pure CSV → Target dicts (no network) ---
+    # --- Phase 6.1: discover-kmu — pure CSV → Target dicts (no HTTP) ---
     sp = sub.add_parser(
         "discover-kmu", parents=[sub_parent],
         help="Phase 6.1: expand company-quickcheck scout CSV into Target dicts "
-             "(pure; no network; pipe output into `fetch`)",
+             "(pure CSV→JSON by default; --dns-pre-flight adds DNS lookups)",
     )
     sp.add_argument("--scout-csv", required=True,
                     help="path to a scout_*.csv file OR the parent directory "
@@ -577,6 +634,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--alternate-relevance", type=float, default=0.30,
                     help="predicted_relevance for subsequent candidate URLs per domain")
     sp.add_argument("--out", help="write targets JSON to this file instead of stdout")
+    sp.add_argument("--dns-pre-flight", action="store_true",
+                    help="DNS-resolve each apex domain before URL expansion; "
+                         "drop rows whose apex doesn't resolve (no HTTP, no "
+                         "residential budget — just local DNS lookups)")
+    sp.add_argument("--dns-timeout", type=float, default=2.0,
+                    help="per-apex DNS lookup timeout in seconds (default: 2.0)")
+    sp.add_argument("--out-dropped",
+                    help="if set, write a CSV of dropped rows (sentinel, "
+                         "missing_name, dns_nxdomain, dns_timeout) to this "
+                         "path. Format is company-quickcheck-ingestible.")
     sp.set_defaults(func=cmd_discover_kmu)
 
     sp = sub.add_parser("fetch", parents=[sub_parent], help="[iter-2] fetch a list of targets (NETWORK — honours Pillar 0 + 0b)")
