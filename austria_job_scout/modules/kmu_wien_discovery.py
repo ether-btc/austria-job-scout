@@ -18,9 +18,10 @@ import csv
 import json
 import logging
 import re
-from dataclasses import dataclass
+import socket
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from bs4 import BeautifulSoup
 
@@ -83,6 +84,99 @@ def _normalize_apex_domain(raw: str | None) -> str:
     return host
 
 
+# ---------------------------------------------------------------------------
+# DNS pre-flight
+# ---------------------------------------------------------------------------
+#
+# Residential-IP protection (Pillar 0) demands we never spend an HTTP
+# request on a URL whose host cannot possibly resolve. The day-1 scout CSV
+# is hand-curated and contains typo artefacts (NXDOMAIN apex domains,
+# parked domains, multi-URL cells). DNS pre-flight catches these *before*
+# they enter the wishlist, so:
+#
+#   - the residential fetch budget is never wasted on guaranteed-fail
+#     requests;
+#   - we can emit a structured dropped-rows CSV as feedback to the
+#     company-quickcheck day-1 recheck pipeline (so future recheck runs
+#     exclude those rows from the start).
+#
+# DNS lookups are local (no HTTP, no residential budget hit). A 2-second
+# timeout per apex keeps wall time bounded for ~500-row sheets.
+
+
+@dataclass
+class DroppedRow:
+    """One scout row rejected by the pre-flight (DNS or sentinel).
+
+    The shape is intentionally CSV-friendly so it can be ingested by
+    company-quickcheck as a `registry_excluded.csv`-style exclusion list.
+    """
+
+    source_sheet: str
+    source_row_id: str
+    company_name: str
+    company_website: str  # raw input, may be empty
+    dropped_apex: str      # what we tried to resolve (or "" if pre-apex rejection)
+    reason: str            # human-readable, e.g. "dns_nxdomain", "dns_timeout", "sentinel"
+    notes: str = ""
+
+
+# Default DNS timeout — kept short because we're probing 100s of apexes.
+_DNS_TIMEOUT_S: float = 2.0
+
+
+def dns_resolves(apex: str, *, timeout_s: float = _DNS_TIMEOUT_S,
+                 resolver: Callable[..., Any] | None = None) -> tuple[bool, str]:
+    """Return ``(ok, reason)`` for whether *apex* has any A/AAAA record.
+
+    Parameters
+    ----------
+    apex
+        Bare hostname (no scheme, no path).
+    timeout_s
+        Per-lookup timeout in seconds. Default 2.0.
+    resolver
+        Optional override for :func:`socket.getaddrinfo` (used by tests).
+        Signature must match ``(host, port, family, type, proto, flags)``
+        and return an iterable of 5-tuples.
+
+    Returns
+    -------
+    (True, "") if the apex has at least one A or AAAA record.
+    (False, "dns_nxdomain") if :class:`socket.gaierror` is raised (no record).
+    (False, "dns_timeout") if :class:`socket.timeout` is raised.
+    (False, "dns_error: <repr>") for any other socket-level failure.
+    """
+    if not apex:
+        return (False, "sentinel")
+    fn = resolver if resolver is not None else socket.getaddrinfo
+    try:
+        # family=0 lets the resolver choose A or AAAA.
+        results = fn(apex, None, 0, 0, 0, 0)
+    except socket.gaierror as e:
+        return (False, "dns_nxdomain" if getattr(e, "errno", None) else f"dns_error:{e!r}")
+    except socket.timeout:
+        return (False, "dns_timeout")
+    except OSError as e:
+        return (False, f"dns_error:{e!r}")
+    if not results:
+        return (False, "dns_empty")
+    return (True, "")
+
+
+def dns_preflight(apex: str, *, timeout_s: float = _DNS_TIMEOUT_S) -> bool:
+    """Boolean wrapper around :func:`dns_resolves` for ergonomic use.
+
+    Logs the failure reason at DEBUG level so operators can see what was
+    dropped without the function being noisy at INFO. Sentinel hosts
+    (empty string) are filtered by :func:`dns_resolves` itself.
+    """
+    ok, reason = dns_resolves(apex, timeout_s=timeout_s)
+    if not ok:
+        logger.debug("dns_preflight dropped %r: %s", apex, reason)
+    return ok
+
+
 def _candidate_row(
     *,
     source_sheet: str,
@@ -124,6 +218,10 @@ def scout_csv_targets(
     sheets: Iterable[str] | None = None,
     primary_relevance: float = 0.45,
     alternate_relevance: float = 0.30,
+    dns_preflight_enabled: bool = False,
+    dns_timeout_s: float = _DNS_TIMEOUT_S,
+    on_dropped: Callable[[DroppedRow], None] | None = None,
+    resolver: Callable[..., Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Expand a company-quickcheck scout CSV into a list of KMU Target dicts.
 
@@ -143,6 +241,20 @@ def scout_csv_targets(
     primary_relevance, alternate_relevance
         Predicted-relevance scores for the first / subsequent candidate URL
         per domain. Defaults reflect "no ATS known → moderate confidence".
+    dns_preflight_enabled
+        When True (default False for back-compat), each unique apex domain
+        is DNS-resolved before URL expansion. Rows whose apex does not
+        resolve are dropped (and reported via *on_dropped*). Opt-in because
+        the lookups take ~0.1-2s per apex and may not be wanted in CI.
+    dns_timeout_s
+        Per-lookup timeout (only honoured when *dns_preflight_enabled*).
+    on_dropped
+        Optional callback invoked once per dropped row (sentinel OR DNS).
+        Used by callers that want to persist a dropped-rows CSV. The
+        callback is also invoked for sentinel rejections (so the upstream
+        pipeline gets a complete picture).
+    resolver
+        Optional override for :func:`socket.getaddrinfo` (testing).
 
     Returns
     -------
@@ -152,10 +264,30 @@ def scout_csv_targets(
 
     Notes
     -----
-    Pure, no network. Sentinel domains (``nan``, ``none``, ``null``, ``""``,
-    TLDless) are filtered out before URL expansion so the residential fetch
-    budget is never spent on ``https://jobs.nan/``.
+    Pure, no network — *unless* ``dns_preflight_enabled=True``, in which
+    case the function performs DNS lookups (no HTTP, no residential
+    budget). Sentinel domains (``nan``, ``none``, ``null``, ``""``,
+    TLDless) are filtered out before URL expansion so the residential
+    fetch budget is never spent on ``https://jobs.nan/``.
     """
+    def _emit_dropped(*, source_sheet: str, source_row_id: str,
+                      company_name: str, company_website: str,
+                      dropped_apex: str, reason: str, notes: str = "") -> None:
+        if on_dropped is None:
+            return
+        try:
+            on_dropped(DroppedRow(
+                source_sheet=source_sheet,
+                source_row_id=source_row_id,
+                company_name=company_name,
+                company_website=company_website,
+                dropped_apex=dropped_apex,
+                reason=reason,
+                notes=notes,
+            ))
+        except Exception as e:  # pragma: no cover — defensive
+            logger.warning("on_dropped callback raised %s: %s", type(e).__name__, e)
+
     scout_csv = Path(scout_csv)
     if scout_csv.is_dir():
         chosen = list(sheets) if sheets else list(_SCOUT_SHEET_PRIORITY.keys())
@@ -166,6 +298,21 @@ def scout_csv_targets(
     out: list[dict[str, Any]] = []
     rows_expanded = 0
     truncated = False
+    # Track which apexes we've already DNS-checked (or skipped) so we
+    # don't re-query 16× per row — only the first row of each domain
+    # pays the DNS cost.
+    apex_dns_state: dict[str, str] = {}  # apex -> "" (ok) | reason (dropped)
+
+    def _dns_state_for(apex: str) -> str:
+        """Return '' if apex resolves, else a non-empty reason."""
+        if apex in apex_dns_state:
+            return apex_dns_state[apex]
+        if not dns_preflight_enabled:
+            apex_dns_state[apex] = ""  # assume ok
+            return ""
+        ok, reason = dns_resolves(apex, timeout_s=dns_timeout_s, resolver=resolver)
+        apex_dns_state[apex] = "" if ok else reason
+        return apex_dns_state[apex]
 
     # Process in priority order so max_rows truncation favours the wishlist.
     for src in sorted(sources, key=lambda p: _SCOUT_SHEET_PRIORITY.get(p.name, 99)):
@@ -189,17 +336,49 @@ def scout_csv_targets(
                     or row.get("website")
                     or ""
                 )
-                apex = _normalize_apex_domain(website)
-                if not apex:
-                    continue
                 name = (
                     row.get("name")
                     or row.get("company_name")
                     or ""
                 ).strip()
-                if not name:
-                    continue
                 row_id = str(row.get("row_id", "")).strip()
+
+                apex = _normalize_apex_domain(website)
+                if not apex:
+                    _emit_dropped(
+                        source_sheet=sheet_name,
+                        source_row_id=row_id,
+                        company_name=name,
+                        company_website=website,
+                        dropped_apex="",
+                        reason="sentinel",
+                        notes="rejected by _normalize_apex_domain",
+                    )
+                    continue
+
+                if not name:
+                    _emit_dropped(
+                        source_sheet=sheet_name,
+                        source_row_id=row_id,
+                        company_name="",
+                        company_website=website,
+                        dropped_apex=apex,
+                        reason="missing_name",
+                        notes="apex valid but row has no company_name",
+                    )
+                    continue
+
+                dns_reason = _dns_state_for(apex)
+                if dns_reason:
+                    _emit_dropped(
+                        source_sheet=sheet_name,
+                        source_row_id=row_id,
+                        company_name=name,
+                        company_website=website,
+                        dropped_apex=apex,
+                        reason=dns_reason,
+                    )
+                    continue
 
                 urls = build_kmu_career_urls(SeedCompany(name=name, domain=apex))
                 if not urls:
