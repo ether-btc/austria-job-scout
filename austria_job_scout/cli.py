@@ -309,6 +309,82 @@ def cmd_discover_kmu(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dropped_stats(args: argparse.Namespace) -> int:
+    """Phase 6.2 — summarise a dropped-rows CSV for operator triage.
+
+    Pure read-only. No network, no DB, no mutations. Reads the dropped.csv
+    produced by ``discover-kmu --out-dropped`` (or by any compatible
+    producer; the schema is documented in
+    :data:`austria_job_scout.modules.kmu_wien_discovery.DROPPED_CSV_FIELDS`).
+
+    Emits either a human-readable table (default) or machine-readable
+    JSON (``--json``) to stdout. Useful as a sanity-check step before
+    feeding the dropped.csv into ``company-quickcheck apply-ajs-exclusions``.
+
+    Exit code is non-zero (``2``) when:
+
+    * the input file is missing — operators want to know the file wasn't
+      even produced (likely the upstream ``discover-kmu`` run failed).
+    * the input has any unknown reason codes (``dns_error:...``) — these
+      are opaque, may indicate a regression, and should be triaged before
+      they silently propagate as EXCLUDE markers downstream.
+
+    Otherwise exit code is ``0`` (clean: nothing to triage).
+    """
+    from .modules import kmu_wien_discovery as kmu
+
+    path = Path(args.dropped_csv)
+    if not path.exists():
+        print(f"error: dropped CSV not found: {path}", file=sys.stderr)
+        return 2
+
+    stats = kmu.summarise_dropped(path)
+
+    if args.json:
+        payload = {
+            "dropped_csv": str(path),
+            "total": stats.total,
+            "by_reason": dict(sorted(stats.by_reason.items())),
+            "by_sheet": dict(sorted(stats.by_sheet.items())),
+            "unique_apexes": stats.unique_apexes,
+            "unknown_reason_rows": stats.unknown_reason_rows,
+            "has_unknown_reasons": stats.has_unknown_reasons,
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 2 if stats.has_unknown_reasons else 0
+
+    # Human-readable table.
+    print(f"dropped.csv: {path}")
+    print(f"  total rows: {stats.total}")
+    if stats.total == 0:
+        print("  (empty — nothing to triage)")
+        return 0
+    print(f"  unique apexes (incl. ''): {stats.unique_apexes}")
+    print()
+    print("  by reason:")
+    for reason, count in sorted(
+        stats.by_reason.items(), key=lambda kv: (-kv[1], kv[0]),
+    ):
+        marker = "  (unknown — triage)" if (
+            reason and reason not in kmu.KNOWN_DROP_REASONS
+        ) else ""
+        print(f"    {reason:<24} {count:>5}{marker}")
+    print()
+    print("  by sheet:")
+    for sheet, count in sorted(
+        stats.by_sheet.items(), key=lambda kv: (-kv[1], kv[0]),
+    ):
+        print(f"    {sheet:<40} {count:>5}")
+    if stats.has_unknown_reasons:
+        print(
+            f"\n  WARN: {stats.unknown_reason_rows} row(s) carry opaque reasons "
+            f"(not in KNOWN_DROP_REASONS); triage before applying downstream.",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
 def cmd_fetch(args: argparse.Namespace) -> int:
     """Fetch a list of targets. NETWORK. Honours Pillar 0 + Pillar 0b."""
     if args.targets == "-":
@@ -645,6 +721,19 @@ def build_parser() -> argparse.ArgumentParser:
                          "missing_name, dns_nxdomain, dns_timeout) to this "
                          "path. Format is company-quickcheck-ingestible.")
     sp.set_defaults(func=cmd_discover_kmu)
+
+    # --- Phase 6.2: dropped-stats — operator summary of a dropped.csv ---
+    sp = sub.add_parser(
+        "dropped-stats", parents=[sub_parent],
+        help="Phase 6.2: print per-reason + per-sheet stats for a "
+             "dropped-rows CSV (output of `discover-kmu --out-dropped`). "
+             "Pure read-only, no network.",
+    )
+    sp.add_argument("--dropped-csv", required=True,
+                    help="path to a dropped.csv produced by `discover-kmu --out-dropped`")
+    sp.add_argument("--json", action="store_true",
+                    help="emit machine-readable JSON instead of a human table")
+    sp.set_defaults(func=cmd_dropped_stats)
 
     sp = sub.add_parser("fetch", parents=[sub_parent], help="[iter-2] fetch a list of targets (NETWORK — honours Pillar 0 + 0b)")
     sp.add_argument("--targets", required=True,

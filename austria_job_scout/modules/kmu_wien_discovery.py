@@ -143,8 +143,15 @@ def dns_resolves(apex: str, *, timeout_s: float = _DNS_TIMEOUT_S,
     Returns
     -------
     (True, "") if the apex has at least one A or AAAA record.
-    (False, "dns_nxdomain") if :class:`socket.gaierror` is raised (no record).
-    (False, "dns_timeout") if :class:`socket.timeout` is raised.
+    (False, "dns_nxdomain") if :class:`socket.gaierror` is raised with
+        ``errno == socket.EAI_NONAME`` (the standard signal that the
+        name has no A/AAAA record). Distinguished from retry-able
+        failures because consumers (e.g. :mod:`company-quickcheck`'s
+        ``apply-ajs-exclusions``) treat NXDOMAIN as a permanent EXCLUDE
+        signal and a transient failure as a retry.
+    (False, "dns_timeout") if either :class:`socket.timeout` is raised
+        OR the gaierror carries ``errno == socket.EAI_AGAIN`` (transient
+        resolver failure — surface it as a timeout so callers can retry).
     (False, "dns_error: <repr>") for any other socket-level failure.
     """
     if not apex:
@@ -154,7 +161,12 @@ def dns_resolves(apex: str, *, timeout_s: float = _DNS_TIMEOUT_S,
         # family=0 lets the resolver choose A or AAAA.
         results = fn(apex, None, 0, 0, 0, 0)
     except socket.gaierror as e:
-        return (False, "dns_nxdomain" if getattr(e, "errno", None) else f"dns_error:{e!r}")
+        errno = getattr(e, "errno", None)
+        if errno == socket.EAI_NONAME:
+            return (False, "dns_nxdomain")
+        if errno == socket.EAI_AGAIN:
+            return (False, "dns_timeout")
+        return (False, f"dns_error:{e!r}")
     except socket.timeout:
         return (False, "dns_timeout")
     except OSError as e:
@@ -175,6 +187,122 @@ def dns_preflight(apex: str, *, timeout_s: float = _DNS_TIMEOUT_S) -> bool:
     if not ok:
         logger.debug("dns_preflight dropped %r: %s", apex, reason)
     return ok
+
+
+# Schema for dropped-rows CSVs emitted by ``discover-kmu --out-dropped``.
+# Kept here (not in cli.py) so it's reusable from tests and from any future
+# producer. The contract is documented in :mod:`company_quickcheck.ajs_exclusions`,
+# the downstream reader — DO NOT reorder / rename columns without bumping the
+# schema version there.
+DROPPED_CSV_FIELDS: tuple[str, ...] = (
+    "source_sheet",
+    "source_row_id",
+    "company_name",
+    "company_website",
+    "dropped_apex",
+    "reason",
+    "notes",
+)
+
+# Stable reason codes (the bare string in the ``reason`` column). These are
+# the lexical symbols that flow through the cross-PR contract with
+# ``company-quickcheck apply-ajs-exclusions``. Anything outside this set is
+# a ``dns_error:<repr>`` style opaque string and should be triaged in the
+# operator's dropped-stats output, not silently EXCLUDEd downstream.
+KNOWN_DROP_REASONS: frozenset[str] = frozenset({
+    "sentinel",          # rejected by _normalize_apex_domain (garbage CSV input)
+    "missing_name",      # valid apex but no company_name column value
+    "dns_nxdomain",      # EAI_NONAME — permanent, mark EXCLUDE
+    "dns_timeout",       # EAI_AGAIN / socket.timeout — transient, retry later
+})
+
+
+@dataclass(frozen=True)
+class DroppedStats:
+    """Per-reason counts + per-sheet breakdown of a dropped-rows CSV.
+
+    Returned by :func:`summarise_dropped`. Pure value object — no I/O,
+    no logging, fully testable.
+    """
+
+    total: int                                          # total rows in the CSV
+    by_reason: dict[str, int] = field(default_factory=dict)
+    by_sheet: dict[str, int] = field(default_factory=dict)
+    unique_apexes: int = 0                               # distinct dropped_apex values (incl. "")
+    unknown_reason_rows: int = 0                         # rows whose reason is not in KNOWN_DROP_REASONS
+
+    @property
+    def has_unknown_reasons(self) -> bool:
+        """True if any row carries an opaque reason (not in KNOWN_DROP_REASONS).
+
+        Used by ``dropped-stats`` to flag rows that operators should triage
+        (e.g. unexpected ``dns_error:...``) rather than silently EXCLUDE.
+        """
+        return self.unknown_reason_rows > 0
+
+
+def _read_dropped_csv_rows(path: Path | str) -> list[dict[str, str]]:
+    """Read the dropped-rows CSV at *path* as a list of row-dicts.
+
+    Internal helper for :func:`summarise_dropped`. Tolerates a missing
+    header (returns empty), missing optional columns (defaults), and a
+    missing file (returns empty — the operator's dropped.csv may not exist
+    yet for the day-1 sheet).
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    with p.open(newline="") as f:
+        rd = csv.DictReader(f)
+        if rd.fieldnames is None:
+            return []
+        return list(rd)
+
+
+def summarise_dropped(path: Path | str) -> DroppedStats:
+    """Read a dropped-rows CSV and return per-reason + per-sheet counts.
+
+    Designed for post-hoc operator workflows:
+        * after a ``discover-kmu --out-dropped dropped.csv`` run
+        * before feeding into ``company-quickcheck apply-ajs-exclusions``
+
+    The summary flags opaque reasons (``dns_error:...``) so the operator
+    can decide whether to triage them upstream or let them pass through
+    to the EXCLUDE marker unchanged.
+
+    Parameters
+    ----------
+    path
+        Path to a dropped-rows CSV in the schema documented at
+        :data:`DROPPED_CSV_FIELDS`. Missing files return an empty
+        :class:`DroppedStats`.
+    """
+    rows = _read_dropped_csv_rows(path)
+    if not rows:
+        return DroppedStats(total=0)
+
+    by_reason: dict[str, int] = {}
+    by_sheet: dict[str, int] = {}
+    unknown_reason_rows = 0
+    dropped_apexes: set[str] = set()
+
+    for row in rows:
+        reason = (row.get("reason") or "").strip()
+        sheet = (row.get("source_sheet") or "<unknown>").strip() or "<unknown>"
+        apex = (row.get("dropped_apex") or "").strip()
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+        by_sheet[sheet] = by_sheet.get(sheet, 0) + 1
+        if reason and reason not in KNOWN_DROP_REASONS:
+            unknown_reason_rows += 1
+        dropped_apexes.add(apex)
+
+    return DroppedStats(
+        total=len(rows),
+        by_reason=by_reason,
+        by_sheet=by_sheet,
+        unique_apexes=len(dropped_apexes),
+        unknown_reason_rows=unknown_reason_rows,
+    )
 
 
 def _candidate_row(
