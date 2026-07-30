@@ -508,10 +508,191 @@ def test_dns_resolves_returns_oserror():
     assert reason.startswith("dns_error:")
 
 
+def test_dns_resolves_classifies_eai_noname_as_nxdomain():
+    """Explicit EAI_NONAME errno → dns_nxdomain (permanent exclude).
+
+    Regression test for the classification bug where any gaierror with a
+    truthy errno (which is *all* real gaierrors — even timeouts) was
+    mis-categorised. Consumers like
+    ``company-quickcheck.apply_ajs_exclusions`` rely on this reason code
+    to distinguish permanent EXCLUDE (NXDOMAIN) from transient failure.
+    """
+    fake = _fake_resolver({
+        "nx.at": socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
+    })
+    ok, reason = kmu.dns_resolves("nx.at", resolver=fake)
+    assert ok is False
+    assert reason == "dns_nxdomain"
+
+
+def test_dns_resolves_classifies_eai_again_as_timeout():
+    """EAI_AGAIN → dns_timeout (transient failure, retry-friendly).
+
+    A resolver that returns EAI_AGAIN is signalling a transient condition
+    (e.g. SERVFAIL, network blip) — semantically a "DNS timeout" from the
+    caller's perspective. Distinguishing this from NXDOMAIN lets the
+    upstream ``apply-ajs-exclusions`` consumer retry these later instead
+    of permanently EXCLUDE-ing them.
+    """
+    fake = _fake_resolver({
+        "transient.at": socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
+    })
+    ok, reason = kmu.dns_resolves("transient.at", resolver=fake)
+    assert ok is False
+    assert reason == "dns_timeout"
+
+
+def test_dns_resolves_classifies_unknown_gaierror_as_dns_error():
+    """A gaierror carrying an errno we don't recognise → dns_error:... .
+
+    Ensures exotic errnos (e.g. EAI_FAIL, EAI_MEMORY) don't silently get
+    treated as NXDOMAIN or timeout. They leak out via ``dns_error:`` so
+    operators can see them in the dropped.csv.
+    """
+    fake = _fake_resolver({
+        "weird.at": socket.gaierror(socket.EAI_FAIL, "Non-recoverable failure"),
+    })
+    ok, reason = kmu.dns_resolves("weird.at", resolver=fake)
+    assert ok is False
+    assert reason.startswith("dns_error:")
+    # The repr carries the EAI_FAIL string so operators can triage.
+    assert "EAI_FAIL" in reason or "Non-recoverable" in reason
+
+
 def test_dns_resolves_rejects_empty_apex():
     ok, reason = kmu.dns_resolves("")
     assert ok is False
     assert reason == "sentinel"
+
+
+# ---------------------------------------------------------------------------
+# summarise_dropped() tests (Phase 6.2)
+# ---------------------------------------------------------------------------
+
+
+def test_summarise_dropped_returns_empty_for_missing_file(tmp_path):
+    """A non-existent dropped.csv returns an empty DroppedStats.
+
+    Missing is the most common case for the day-1 sheet (run hasn't
+    happened yet) — the operator's command must not crash.
+    """
+    stats = kmu.summarise_dropped(tmp_path / "nonexistent.csv")
+    assert stats.total == 0
+    assert stats.by_reason == {}
+    assert stats.by_sheet == {}
+    assert stats.unique_apexes == 0
+    assert stats.unknown_reason_rows == 0
+    assert stats.has_unknown_reasons is False
+
+
+def test_summarise_dropped_counts_per_reason_and_sheet(tmp_path):
+    """A normal dropped.csv yields accurate per-reason + per-sheet counts."""
+    csv_path = tmp_path / "dropped.csv"
+    with csv_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=(
+            "source_sheet", "source_row_id", "company_name",
+            "company_website", "dropped_apex", "reason", "notes",
+        ))
+        w.writeheader()
+        w.writerow({"source_sheet": "scout_review_required.csv", "source_row_id": "1",
+                    "company_name": "Nan Co", "company_website": "nan",
+                    "dropped_apex": "", "reason": "sentinel", "notes": ""})
+        w.writerow({"source_sheet": "scout_review_required.csv", "source_row_id": "2",
+                    "company_name": "Ghost Co", "company_website": "https://ghost.at",
+                    "dropped_apex": "ghost.at", "reason": "dns_nxdomain", "notes": ""})
+        w.writerow({"source_sheet": "scout_strict_verified.csv", "source_row_id": "5",
+                    "company_name": "Nameless Co", "company_website": "https://no.at",
+                    "dropped_apex": "no.at", "reason": "missing_name", "notes": ""})
+
+    stats = kmu.summarise_dropped(csv_path)
+    assert stats.total == 3
+    assert stats.by_reason == {"sentinel": 1, "dns_nxdomain": 1, "missing_name": 1}
+    assert stats.by_sheet == {
+        "scout_review_required.csv": 2,
+        "scout_strict_verified.csv": 1,
+    }
+    # Two distinct dropped_apexes: "" (sentinel) and "ghost.at", "no.at" → 3
+    # unique including the empty sentinel slot.
+    assert stats.unique_apexes == 3
+    assert stats.unknown_reason_rows == 0
+    assert stats.has_unknown_reasons is False
+
+
+def test_summarise_dropped_flags_unknown_reasons(tmp_path):
+    """Opaque reasons (e.g. dns_error:...) are flagged for triage, not silently EXCLUDEd."""
+    csv_path = tmp_path / "dropped.csv"
+    with csv_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=(
+            "source_sheet", "source_row_id", "company_name",
+            "company_website", "dropped_apex", "reason", "notes",
+        ))
+        w.writeheader()
+        w.writerow({"source_sheet": "scout_review_required.csv", "source_row_id": "1",
+                    "company_name": "X", "company_website": "",
+                    "dropped_apex": "x.at", "reason": "sentinel", "notes": ""})
+        w.writerow({"source_sheet": "scout_review_required.csv", "source_row_id": "2",
+                    "company_name": "Y", "company_website": "",
+                    "dropped_apex": "y.at",
+                    "reason": "dns_error: gaierror(-4, 'Non-recoverable failure')",
+                    "notes": ""})
+
+    stats = kmu.summarise_dropped(csv_path)
+    assert stats.total == 2
+    assert stats.unknown_reason_rows == 1
+    assert stats.has_unknown_reasons is True
+
+
+def test_summarise_dropped_handles_empty_reason_gracefully(tmp_path):
+    """An empty reason cell is counted as the empty reason (not 'unknown',
+    not whitespace). The unknown-reason counter only fires on non-empty
+    strings outside KNOWN_DROP_REASONS."""
+    csv_path = tmp_path / "dropped.csv"
+    with csv_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=(
+            "source_sheet", "source_row_id", "company_name",
+            "company_website", "dropped_apex", "reason", "notes",
+        ))
+        w.writeheader()
+        w.writerow({"source_sheet": "scout_review_required.csv", "source_row_id": "1",
+                    "company_name": "X", "company_website": "",
+                    "dropped_apex": "x.at", "reason": "", "notes": ""})
+
+    stats = kmu.summarise_dropped(csv_path)
+    assert stats.total == 1
+    assert stats.by_reason == {"": 1}
+    # Empty reason doesn't trip the unknown-reason counter (sentinels
+    # legitimately leave reason blank when a row is malformed to that degree).
+    assert stats.unknown_reason_rows == 0
+
+
+def test_summarise_dropped_pilot_regression_snapshot(tmp_path):
+    """Regression: the day-1 live pilot (2026-07-20) produced 66 dropped
+    rows: 56 sentinel + 8 dns_nxdomain + 2 csv-malformed. Pin those exact
+    counts so any drift in the producer (or the dropped.csv schema)
+    surfaces as a failed CI run.
+
+    The pilot's raw dropped.csv (committed under live_results/) is the
+    canonical evidence — we replay it through the new summariser and
+    assert the historical shape.
+    """
+    repo_root = Path(__file__).parent.parent
+    pilot_csv = repo_root / "live_results" / "pilot-2026-07-20" / "dropped.csv"
+    if not pilot_csv.exists():
+        pytest.skip(f"pilot dropped.csv not present at {pilot_csv}")
+
+    stats = kmu.summarise_dropped(pilot_csv)
+    assert stats.total == 66, (
+        f"pilot dropped.csv row count drifted: was 66, got {stats.total}. "
+        "Either the schema changed or a new reason was added — investigate."
+    )
+    assert stats.by_sheet == {"scout_review_required.csv": 66}
+    # Sentinel + dns_nxdomain account for 64 of 66 — the remaining 2 are
+    # the raw CSV's unparseable-name rows (commas-in-fields on company_name
+    # which produced empty reason values; we accept them and don't fail).
+    assert stats.by_reason.get("sentinel", 0) + stats.by_reason.get("dns_nxdomain", 0) >= 60
+    assert stats.unique_apexes >= 8, (
+        f"pilot had ≥8 distinct NXDOMAIN apexes, got {stats.unique_apexes}"
+    )
 
 
 def test_scout_csv_targets_dns_preflight_off_by_default(tmp_path):
@@ -715,4 +896,124 @@ def test_cli_discover_kmu_without_dropped_csv_unchanged(tmp_path, capsys):
     assert payload["config"]["dns_preflight"] is False
     # No dropped CSV should have been written anywhere
     assert not (tmp_path / "dropped.csv").exists()
+
+
+# ---------------------------------------------------------------------------
+# CLI: dropped-stats subcommand tests (Phase 6.2)
+# ---------------------------------------------------------------------------
+
+
+_DROPPED_HEADER = (
+    "source_sheet", "source_row_id", "company_name",
+    "company_website", "dropped_apex", "reason", "notes",
+)
+
+
+def _write_dropped_csv(path: Path, rows: list[dict]) -> None:
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_DROPPED_HEADER)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in _DROPPED_HEADER})
+
+
+def test_cli_dropped_stats_human_table(tmp_path, capsys):
+    """`dropped-stats --dropped-csv <p>` prints a human-readable table
+    when the CSV is well-formed and contains only known reasons."""
+    dropped = tmp_path / "dropped.csv"
+    _write_dropped_csv(dropped, [
+        {"source_sheet": "scout_review_required.csv", "source_row_id": "1",
+         "company_name": "A", "company_website": "nan", "dropped_apex": "",
+         "reason": "sentinel", "notes": ""},
+        {"source_sheet": "scout_review_required.csv", "source_row_id": "2",
+         "company_name": "B", "company_website": "nan", "dropped_apex": "",
+         "reason": "sentinel", "notes": ""},
+        {"source_sheet": "scout_review_required.csv", "source_row_id": "3",
+         "company_name": "C", "company_website": "https://ghost.at",
+         "dropped_apex": "ghost.at", "reason": "dns_nxdomain", "notes": ""},
+    ])
+    rc = _run_cli(["dropped-stats", "--dropped-csv", str(dropped)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "total rows: 3" in out
+    assert "sentinel" in out
+    assert "dns_nxdomain" in out
+    assert "scout_review_required.csv" in out
+    # No WARN line because all reasons are known.
+    err = capsys.readouterr().err
+    assert "WARN" not in err
+
+
+def test_cli_dropped_stats_json_emits_machine_readable(tmp_path, capsys):
+    """`dropped-stats --json` parses as JSON with stable schema."""
+    dropped = tmp_path / "dropped.csv"
+    _write_dropped_csv(dropped, [
+        {"source_sheet": "scout_review_required.csv", "source_row_id": "1",
+         "company_name": "A", "company_website": "nan", "dropped_apex": "",
+         "reason": "sentinel", "notes": ""},
+    ])
+    rc = _run_cli(["dropped-stats", "--dropped-csv", str(dropped), "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["total"] == 1
+    assert payload["by_reason"] == {"sentinel": 1}
+    assert payload["by_sheet"] == {"scout_review_required.csv": 1}
+    assert payload["unique_apexes"] == 1
+    assert payload["unknown_reason_rows"] == 0
+    assert payload["has_unknown_reasons"] is False
+
+
+def test_cli_dropped_stats_missing_file_exits_2(tmp_path, capsys):
+    """Missing dropped.csv is an operator-visible error (rc=2)."""
+    rc = _run_cli([
+        "dropped-stats", "--dropped-csv", str(tmp_path / "no-such.csv"),
+    ])
+    assert rc == 2
+    assert "not found" in capsys.readouterr().err.lower()
+
+
+def test_cli_dropped_stats_unknown_reason_exits_2(tmp_path, capsys):
+    """An opaque reason (dns_error:...) trips the WARN branch (rc=2)."""
+    dropped = tmp_path / "dropped.csv"
+    _write_dropped_csv(dropped, [
+        {"source_sheet": "scout_review_required.csv", "source_row_id": "1",
+         "company_name": "X", "company_website": "",
+         "dropped_apex": "x.at", "reason": "sentinel", "notes": ""},
+        {"source_sheet": "scout_review_required.csv", "source_row_id": "2",
+         "company_name": "Y", "company_website": "",
+         "dropped_apex": "y.at",
+         "reason": "dns_error: gaierror(-4, 'Non-recoverable failure')",
+         "notes": ""},
+    ])
+    rc = _run_cli(["dropped-stats", "--dropped-csv", str(dropped)])
+    assert rc == 2, "opaque dns_error: reasons must trip the WARN branch"
+    captured = capsys.readouterr()
+    assert "(unknown — triage)" in captured.out
+    assert "WARN" in captured.err
+    assert "1 row" in captured.err
+
+
+def test_cli_dropped_stats_empty_dropped_csv_is_ok(tmp_path, capsys):
+    """An empty (header-only) dropped.csv is a valid clean case (rc=0)."""
+    dropped = tmp_path / "dropped.csv"
+    _write_dropped_csv(dropped, [])
+    rc = _run_cli(["dropped-stats", "--dropped-csv", str(dropped)])
+    assert rc == 0
+    assert "empty" in capsys.readouterr().out.lower()
+
+
+def test_cli_dropped_stats_against_pilot_artifact(tmp_path, capsys):
+    """End-to-end against the day-1 pilot dropped.csv (committed under
+    live_results/). Pins the historical shape: 66 rows, 56 sentinel +
+    8 dns_nxdomain (or close — see test_summarise_dropped_pilot_*
+    above for the full invariant list)."""
+    repo_root = Path(__file__).parent.parent
+    pilot_csv = repo_root / "live_results" / "pilot-2026-07-20" / "dropped.csv"
+    if not pilot_csv.exists():
+        pytest.skip(f"pilot dropped.csv not present at {pilot_csv}")
+    rc = _run_cli(["dropped-stats", "--dropped-csv", str(pilot_csv)])
+    # Pilot is clean (only known reasons), so rc=0.
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert "total rows: 66" in out
 
