@@ -90,6 +90,30 @@ def _job_to_dict(job) -> dict:
     return result
 
 
+def _load_profile_arg(profile_arg: Optional[str]) -> Optional[dict]:
+    """Load a candidate profile dict from a ``--profile`` argument.
+
+    Returns ``None`` when no profile is supplied (gates then stay silent).
+    Accepts a path to a JSON file; otherwise treats the string as inline
+    JSON. Raises ``ValueError`` with a friendly message on parse errors so
+    the CLI can surface it as exit code 1.
+    """
+    if not profile_arg:
+        return None
+    if Path(profile_arg).is_file():
+        try:
+            return json.loads(Path(profile_arg).read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON profile in {profile_arg}: {e}")
+    try:
+        return json.loads(profile_arg)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"--profile is neither a file nor inline JSON: {e}")
+
+
+
+
+
 # ---------------------------------------------------------------------------
 # Subcommand handlers
 # ---------------------------------------------------------------------------
@@ -136,9 +160,13 @@ def cmd_discover(args: argparse.Namespace) -> int:
       - a path to a JSON file (output of `ingest`)
       - a JSON string on stdin (piped)
     """
+    # Optional pre-index gate: drop targets that fail eligibility/language
+    # gates *before* they are fetched (saves network + DB writes).
+    profile = _load_profile_arg(args.profile)
+
     if args.reference == "-":
         ref_dict = json.loads(sys.stdin.read())
-    elif args.reference.startswith(("{", "[")):
+    elif args.reference.startswith(("[", "{")):
         # Inline JSON — don't try Path() (OSError on long strings).
         ref_dict = json.loads(args.reference)
     elif Path(args.reference).is_file():
@@ -167,9 +195,22 @@ def cmd_discover(args: argparse.Namespace) -> int:
         min_relevance=args.min_relevance,
     )
 
+    # Pre-index gate (opt-in). Annotated targets carry a `_gates` key.
+    excluded = []
+    if profile is not None:
+        from .gatekit import gate_targets
+        targets, excluded = gate_targets(targets, profile, exclude_fail=True)
+        if excluded:
+            print(
+                f"pre-index gate excluded {len(excluded)} target(s) "
+                f"(eligibility/language)",
+                file=sys.stderr,
+            )
+
     payload = {
         "reference_id": ref_dict.get("id"),
         "target_count": len(targets),
+        "gated_excluded": len(excluded),
         "config": {
             "aggressive_mode": config.AGGRESSIVE_MODE,
             "max_targets_per_run": config.MAX_TARGETS_PER_RUN,
@@ -235,6 +276,21 @@ def cmd_discover_kmu(args: argparse.Namespace) -> int:
         dns_timeout_s=args.dns_timeout,
         on_dropped=dropped.append,
     )
+
+    # Optional pre-index gate: drop targets that fail eligibility/language
+    # gates *before* they are fetched (saves network + DB writes).
+    profile = _load_profile_arg(args.profile)
+    if profile is not None:
+        from .gatekit import gate_targets
+        before = len(targets)
+        targets, _ = gate_targets(targets, profile, exclude_fail=True)
+        dropped_gate = before - len(targets)
+        if dropped_gate:
+            print(
+                f"pre-index gate excluded {dropped_gate} target(s) "
+                f"(eligibility/language)",
+                file=sys.stderr,
+            )
 
     # Optional Pillar-0b-style discrimination filter — matches the
     # `discover` subcommand's behaviour so the output is interchangeable.
@@ -686,6 +742,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-aggregators", action="store_true", help="skip karriere.at / jobs.at / AMS aggregator queries")
     sp.add_argument("--min-relevance", type=float, default=0.15,
                     help="drop targets below this predicted relevance (0.0-1.0)")
+    sp.add_argument("--profile", default=None,
+                    help="optional candidate profile JSON (file path or inline) "
+                         "used for the opt-in pre-index eligibility/language gate")
     sp.set_defaults(func=cmd_discover)
 
     # --- Phase 6.1: discover-kmu — pure CSV → Target dicts (no HTTP) ---
@@ -720,6 +779,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="if set, write a CSV of dropped rows (sentinel, "
                          "missing_name, dns_nxdomain, dns_timeout) to this "
                          "path. Format is company-quickcheck-ingestible.")
+    sp.add_argument("--profile", default=None,
+                    help="optional candidate profile JSON (file path or inline) "
+                         "used for the opt-in pre-index eligibility/language gate")
     sp.set_defaults(func=cmd_discover_kmu)
 
     # --- Phase 6.2: dropped-stats — operator summary of a dropped.csv ---
